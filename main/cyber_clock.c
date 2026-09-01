@@ -431,6 +431,11 @@ static void update_time_display(void)
     snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
     lv_label_set_text(s_time_label, buf);
 
+    // 未同步时时间主文字闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
+    // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或蓝牙任一方式）。
+    lv_obj_set_style_text_opa(s_time_label,
+        (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
+
     // SS
     snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
     lv_label_set_text(s_sec_label, buf);

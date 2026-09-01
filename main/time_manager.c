@@ -62,6 +62,17 @@ esp_err_t time_manager_init(void)
         nvs_close(h);
     }
 
+    // 重启检测：本机没有 RTC 电池，断电/深度睡眠后 esp_timer 归零。
+    // 若上次同步时刻"在未来"（last_sync_ms > 当前单调钟），说明发生了重启——
+    // 当前时间只是 NVS 恢复的粗略旧值，不可信。如实清除 synced 标志并持久化，
+    // 让 UI / BLE 通知 / USB Q 命令都显示未同步（v6 省电策略亦据此自动开广播等待对时）。
+    if (s_state.synced &&
+        s_state.last_sync_ms > esp_timer_get_time() / 1000) {
+        s_state.synced = false;
+        persist_state();
+        ESP_LOGI(TAG, "检测到重启：恢复的时间不可信，synced 已清除（等待重新同步）");
+    }
+
     s_initialized = true;
     ESP_LOGI(TAG, "初始化完成: synced=%d tz=%ld sync_count=%u",
              s_state.synced, (long)s_state.tz_offset, s_state.sync_count);
