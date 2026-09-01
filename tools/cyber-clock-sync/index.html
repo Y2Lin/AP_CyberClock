@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AP_CyberClock · 在线工具</title>
+<style>
+  :root {
+    --bg: #05060a; --panel: #0b0e16; --line: #16202e;
+    --cyan: #00f0ff; --magenta: #ff2ec4; --amber: #ffb347;
+    --ink: #c8e6ff; --dim: #6b7d94;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "PingFang SC",
+                 "Microsoft YaHei", system-ui, sans-serif;
+    min-height: 100vh; padding: 28px 18px 48px;
+    background-image:
+      linear-gradient(rgba(0,240,255,.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,240,255,.035) 1px, transparent 1px);
+    background-size: 34px 34px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 30px; }
+  .hud {
+    display: inline-block; position: relative; padding: 18px 34px 10px;
+  }
+  .hud::before, .hud::after {
+    content: ""; position: absolute; width: 22px; height: 22px;
+    border: 2px solid var(--cyan);
+  }
+  .hud::before { top: 0; left: 0; border-right: none; border-bottom: none; }
+  .hud::after { bottom: 0; right: 0; border-left: none; border-top: none; }
+  h1 {
+    font-size: 30px; letter-spacing: 4px; color: var(--cyan);
+    text-shadow: 0 0 14px rgba(0,240,255,.55); font-weight: 700;
+  }
+  .sub { color: var(--dim); font-size: 13px; margin-top: 8px; letter-spacing: 1px; }
+  .sub b { color: var(--magenta); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  a.card {
+    display: block; text-decoration: none; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 22px 20px 18px;
+    transition: transform .15s, border-color .15s, box-shadow .15s;
+  }
+  a.card:hover {
+    transform: translateY(-3px); border-color: var(--cyan);
+    box-shadow: 0 8px 26px rgba(0,240,255,.12);
+  }
+  .card .tag {
+    display: inline-block; font-size: 11px; letter-spacing: 2px; padding: 2px 8px;
+    border: 1px solid; border-radius: 3px; margin-bottom: 12px;
+  }
+  .tag.c { color: var(--cyan); border-color: var(--cyan); }
+  .tag.m { color: var(--magenta); border-color: var(--magenta); }
+  .tag.a { color: var(--amber); border-color: var(--amber); }
+  .card h2 { font-size: 19px; color: #fff; margin-bottom: 8px; letter-spacing: 1px; }
+  .card p { font-size: 13px; color: var(--dim); line-height: 1.7; }
+  .card p b { color: var(--ink); font-weight: 600; }
+
+  section { margin-top: 34px; }
+  h3 {
+    font-size: 14px; color: var(--magenta); letter-spacing: 3px;
+    border-left: 3px solid var(--magenta); padding-left: 10px; margin-bottom: 14px;
+  }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); }
+  th, td { padding: 10px 12px; border: 1px solid var(--line); font-size: 13px; text-align: left; }
+  th { color: var(--cyan); font-weight: 600; white-space: nowrap; }
+  td a { color: var(--cyan); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  td.dim { color: var(--dim); }
+  code {
+    font-family: "JetBrains Mono", Consolas, monospace; font-size: 12px;
+    color: var(--amber); word-break: break-all;
+  }
+  ul.docs { list-style: none; }
+  ul.docs li { padding: 7px 0; border-bottom: 1px dashed var(--line); font-size: 14px; }
+  ul.docs a { color: var(--cyan); text-decoration: none; }
+  ul.docs a:hover { text-decoration: underline; }
+  ul.docs li::before { content: "▸ "; color: var(--magenta); }
+
+  .note {
+    margin-top: 26px; padding: 14px 16px; border: 1px solid var(--line);
+    border-left: 3px solid var(--amber); background: var(--panel);
+    font-size: 13px; color: var(--dim); line-height: 1.9;
+  }
+  .note b { color: var(--amber); }
+  footer { text-align: center; margin-top: 40px; color: var(--dim); font-size: 12px; line-height: 2; }
+  footer a { color: var(--cyan); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="hud">
+      <h1>AP_CYBERCLOCK</h1>
+      <div class="sub">FoloToy AI Passport · ESP32-C3 · 固件 <b>v6</b> · 蓝牙/USB 双通道对时</div>
+    </div>
+  </header>
+
+  <div class="cards">
+    <a class="card" href="web-sync.html">
+      <span class="tag c">TIME SYNC</span>
+      <h2>⏱ 时间同步</h2>
+      <p><b>USB 线</b>（最简单，插线即用）或 <b>蓝牙</b>双通道对时页。<br>
+      Chrome / Edge 浏览器直连设备，自动写入当前时间与时区。</p>
+    </a>
+    <a class="card" href="local-flasher.html">
+      <span class="tag m">FLASH</span>
+      <h2>🔥 固件刷写</h2>
+      <p>浏览器离线刷机页，选本地 <b>.bin</b> 一键写入与校验。<br>
+      支持合并固件或分区固件，文件不上传。</p>
+    </a>
+    <a class="card" href="https://github.com/Y2Lin/AP_CyberClock">
+      <span class="tag a">SOURCE</span>
+      <h2>📦 源码仓库</h2>
+      <p>GitHub 上的 <b>AP_CyberClock</b>：固件源码、构建方法、<br>
+      对时协议说明与完整文档。</p>
+    </a>
+  </div>
+
+  <section>
+    <h3>固件下载（v6 · 预编译）</h3>
+    <table>
+      <tr><th>文件</th><th>大小</th><th>刷入地址</th><th>SHA256</th></tr>
+      <tr>
+        <td><a href="firmware/FoloToy-AI-Passport-full.bin" download>合并固件（推荐）</a></td>
+        <td class="dim">1.7 MB</td><td class="dim"><code>0x0</code></td>
+        <td><code>9b50353f0fd8f5d3…7009e</code></td>
+      </tr>
+      <tr>
+        <td><a href="firmware/bootloader.bin" download>bootloader</a></td>
+        <td class="dim">22 KB</td><td class="dim"><code>0x0</code></td>
+        <td><code>9bfd02cbb041c6ec…5da41</code></td>
+      </tr>
+      <tr>
+        <td><a href="firmware/partition-table.bin" download>分区表</a></td>
+        <td class="dim">3 KB</td><td class="dim"><code>0x8000</code></td>
+        <td><code>71ff0aa394f20806…0c3a</code></td>
+      </tr>
+      <tr>
+        <td><a href="firmware/FoloToy-AI-Passport.bin" download>应用（升级用）</a></td>
+        <td class="dim">1.6 MB</td><td class="dim"><code>0x10000</code></td>
+        <td><code>2f7dcdf5947fc034…c1cec</code></td>
+      </tr>
+    </table>
+  </section>
+
+  <section>
+    <h3>文档</h3>
+    <ul class="docs">
+      <li><a href="https://github.com/Y2Lin/AP_CyberClock/blob/main/tools/cyber-clock-sync/%E7%83%A7%E5%BD%95%E6%8C%87%E5%8D%97.md">烧录指南 — 刷机步骤与常见问题</a></li>
+      <li><a href="https://github.com/Y2Lin/AP_CyberClock/blob/main/tools/cyber-clock-sync/%E6%97%B6%E9%92%9F%E5%8A%9F%E8%83%BD%E4%B8%8EBLE%E5%90%8C%E6%AD%A5%E8%AF%B4%E6%98%8E.md">时钟功能与 BLE 同步说明 — 功能、协议与排障</a></li>
+      <li><a href="https://github.com/Y2Lin/AP_CyberClock/blob/main/tools/cyber-clock-sync/%E6%9E%84%E5%BB%BA%E4%BF%A1%E6%81%AF.md">构建信息 — 构建环境与完整 SHA256 校验</a></li>
+    </ul>
+  </section>
+
+  <div class="note">
+    <b>提示</b>：Web Bluetooth / Web Serial 需要 HTTPS 环境，本站已满足；设备上
+    <b>时间未同步时蓝牙自动开启</b>（屏幕右上角 <b>BT ADV</b>），<b>同步成功约 5 秒后自动关闭</b>省电，
+    需要再次同步时在设备上<b>短按 OK 键</b>重新打开。USB 对时不受蓝牙开关影响，任意页面可用。
+    <code>github.io</code> 在中国大陆可能无法访问，届时请下载仓库内
+    <code>tools/cyber-clock-sync/</code> 的文件本地使用。
+  </div>
+
+  <footer>
+    本页随仓库 <a href="https://github.com/Y2Lin/AP_CyberClock/actions/workflows/pages.yml">Pages 工作流</a>自动部署 ·
+    基于 <a href="https://github.com/folotoy/ai-passport">folotoy/ai-passport</a>（MIT License）·
+    <a href="README.zh_CN.md">项目说明</a>
+  </footer>
+
+</div>
+</body>
+</html>

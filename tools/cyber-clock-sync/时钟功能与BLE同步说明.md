@@ -192,7 +192,7 @@ Q
 
 **浏览器要求**：Chrome（macOS）、Edge、Opera 均支持；**Safari、Firefox 不支持**；iPhone / iPad 所有浏览器均不支持（iOS 强制 WebKit 内核），iOS 请用 LightBlue App。
 
-**扩展用法**：把 `web-sync.html` 上传到任意 HTTPS 静态托管（如 GitHub Pages），安卓手机用 Chrome 打开同样可用，免装 nRF Connect。
+**扩展用法**：把 `web-sync.html` 上传到任意 HTTPS 静态托管（如 GitHub Pages），安卓手机用 Chrome 打开同样可用，免装 nRF Connect。本项目的在线版已部署：<b>https://y2lin.github.io/AP_CyberClock/web-sync.html</b>（大陆访问 github.io 不稳定时用本地文件）。
 
 ### 方法二：mac-sync.py 脚本（Chrome 搜不到时的可靠替代）
 
