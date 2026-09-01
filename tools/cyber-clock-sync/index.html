@@ -357,18 +357,47 @@ function refreshPreviews() {
   }
 }
 
+// ---- GATT 操作串行队列 ----
+// Web Bluetooth 不允许并发 GATT 操作：上一个 await 未完成时再发起下一个，
+// 浏览器会报 "GATT operation already in progress"。所有写操作必须排队执行。
+let gattChain = Promise.resolve();
+function gattSerial(task) {
+  const run = gattChain.then(task, task);   // 前序失败不影响本任务执行
+  gattChain = run.catch(() => {});          // 防止链条断裂
+  return run;
+}
+
+let bleBusy = false;   // 写入进行中标志（防按钮重入）
+
 async function writeTime(dateObj, tzHours) {
   if (!charWrite) return;
+  if (bleBusy) { log("上一次写入还在进行中，请稍候…", "warn"); return; }
+  bleBusy = true;
+  $("btnSyncNow").disabled = true;
+  $("btnWriteCustom").disabled = true;
   const { buf, ts } = buildPayload(dateObj, tzHours);
   try {
-    await charWrite.writeValueWithResponse(buf);
+    await gattSerial(() => charWrite.writeValueWithResponse(buf));
     log(`已写入 FFC1：ts=${ts} tz=${tzHours}h`, "ok");
+    log("设备将在约 5 秒后自动断开并关闭蓝牙（v6 省电策略，正常现象）；再次同步请在设备上按 OK 键重开蓝牙", "info");
   } catch (e) {
-    try {
-      await charWrite.writeValueWithoutResponse(buf);
-      log(`已写入 FFC1（无响应模式）：ts=${ts} tz=${tzHours}h`, "ok");
-    } catch (e2) {
-      log(`写入失败：${e2.message}`, "err");
+    // already-in-progress 说明有操作占线（不该发生，队列已串行化）；断开类错误不重试
+    const disconnected = /disconnect/i.test(e.message || "");
+    if (disconnected) {
+      log(`写入失败：连接已断开（若刚同步成功，是设备 5 秒后自动关蓝牙——属正常）；重新连接即可`, "err");
+    } else {
+      try {
+        await gattSerial(() => charWrite.writeValueWithoutResponse(buf));
+        log(`已写入 FFC1（无响应模式）：ts=${ts} tz=${tzHours}h`, "ok");
+      } catch (e2) {
+        log(`写入失败：${e2.message}`, "err");
+      }
+    }
+  } finally {
+    bleBusy = false;
+    if (device && device.gatt.connected) {
+      $("btnSyncNow").disabled = false;
+      $("btnWriteCustom").disabled = false;
     }
   }
 }
@@ -407,7 +436,8 @@ async function connect() {
       : "正在打开设备选择框（显示全部设备）…在列表中找到设备并选中");
     device = await navigator.bluetooth.requestDevice(opts);
     device.addEventListener("gattserverdisconnected", () => {
-      log("连接已断开", "err");
+      log("连接已断开（若刚同步成功，是设备约 5 秒后自动关蓝牙省电——属正常；再同步请在设备上按 OK 键重开蓝牙后重新连接）", "err");
+      bleBusy = false;
       setConnected(false);
     });
     log(`已选中设备：${device.name || "未命名"}`);
