@@ -105,10 +105,10 @@
 
 ### 方法一：网页 USB 对时（推荐，Mac / Windows / Linux 通用）
 
-浏览器原生 **Web Serial** 能力，双击打开包内 `web-sync.html`，切到顶部 **"USB 线同步"** 标签页：
+浏览器原生 **Web Serial** 能力，双击打开包内 `index.html`，切到顶部 **"USB 线同步"** 标签页：
 
 1. USB 数据线连接设备与电脑
-2. Mac / Windows / Linux 的 **Chrome 或 Edge** 打开 `web-sync.html`（双击即可；报安全上下文错误时在网页目录运行 `python3 -m http.server 8000` 后访问 `http://localhost:8000/web-sync.html`）
+2. Mac / Windows / Linux 的 **Chrome 或 Edge** 打开 `index.html`（双击即可；报安全上下文错误时在网页目录运行 `python3 -m http.server 8000` 后访问 `http://localhost:8000/`）
 3. 点击 **连接 USB 设备**，弹窗中选择 **USB 串行设备（VID 303A）**——就是刷机时选的那个 `USB JTAG/serial debug unit` 端口
 4. 页面自动 PING 探活 → 写入本机当前时间与时区 → 回读设备状态，日志区全程可见
 5. 下次对时可直接点 **"重新连接上次设备"**（Chrome 记住了授权，不再弹窗）
@@ -173,10 +173,10 @@ Q
 
 ### 方法一：网页版同步（推荐，无需安装任何东西）
 
-使用浏览器原生 **Web Bluetooth** 能力，双击打开包内 `web-sync.html` 即可（纯本地静态页，无任何数据上传）：
+使用浏览器原生 **Web Bluetooth** 能力，双击打开包内 `index.html` 即可（纯本地静态页，无任何数据上传）：
 
 1. 设备进入 **CyberClock 页面**（BLE 仅在该页面广播）
-2. Mac 上用 **Chrome 或 Edge** 打开 `web-sync.html`（双击即可；若浏览器报安全上下文错误，在网页所在目录运行 `python3 -m http.server 8000`，访问 `http://localhost:8000/web-sync.html`）
+2. Mac 上用 **Chrome 或 Edge** 打开 `index.html`（双击即可；若浏览器报安全上下文错误，在网页所在目录运行 `python3 -m http.server 8000`，访问 `http://localhost:8000/`）
 3. 点击 **连接 CyberClock**，在弹出的设备选择框中选中设备
 4. 页面默认勾选"连接后自动同步时间"——连上即写入本机当前时间与时区，完成校时
 5. 页面下方实时显示 FFC2 通知的设备状态（时间戳、时区、是否已同步），也可写入自定义时间
@@ -192,7 +192,7 @@ Q
 
 **浏览器要求**：Chrome（macOS）、Edge、Opera 均支持；**Safari、Firefox 不支持**；iPhone / iPad 所有浏览器均不支持（iOS 强制 WebKit 内核），iOS 请用 LightBlue App。
 
-**扩展用法**：把 `web-sync.html` 上传到任意 HTTPS 静态托管（如 GitHub Pages），安卓手机用 Chrome 打开同样可用，免装 nRF Connect。本项目的在线版已部署：<b>https://y2lin.github.io/AP_CyberClock/web-sync.html</b>（大陆访问 github.io 不稳定时用本地文件）。
+**扩展用法**：把 `index.html` 上传到任意 HTTPS 静态托管（如 GitHub Pages），安卓手机用 Chrome 打开同样可用，免装 nRF Connect。本项目的在线版已部署：<b>https://y2lin.github.io/AP_CyberClock/</b>（大陆访问 github.io 不稳定时用本地文件）。
 
 ### 方法二：mac-sync.py 脚本（Chrome 搜不到时的可靠替代）
 

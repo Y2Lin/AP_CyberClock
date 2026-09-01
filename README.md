@@ -54,24 +54,22 @@ Supports **BLE** and **USB cable** time sync, with an automatic Bluetooth power-
 ## Quick start
 
 ### 1. Flash the firmware
-Prebuilt binaries (v6) live in [`tools/cyber-clock-sync/`](tools/cyber-clock-sync/):
-- `local-flasher.html` — browser offline flasher (no toolchain needed), or
-- esptool: `esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
+Prebuilt binaries (v6) live in [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/):
+- Browser flash (no install): open the official flasher page — FoloToy's [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/) (vendor) or [esptool-js](https://espressif.github.io/esptool-js/) (Espressif) — in Chrome/Edge, connect the device, add the merged firmware with offset `0x0` and flash — direct download link: <https://y2lin.github.io/AP_CyberClock/firmware/FoloToy-AI-Passport-full.bin>
+- Or esptool: `esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
 
 ### 2. Set the time (pick one)
-- **USB cable (easiest)**: open `web-sync.html` in Chrome/Edge, switch to the "USB" tab, connect, done
+- **USB cable (easiest)**: open `index.html` (locally or online, see below), switch to the "USB" tab, connect, done
 - **Phone Bluetooth**: connect to `CyberClock` with nRF Connect / LightBlue, write a timestamp to `FFC1`
-- **Mac Bluetooth**: `web-sync.html` BLE tab, or the `mac-sync.py` script
+- **Mac Bluetooth**: the BLE tab of `index.html`, or the `mac-sync.py` script
 
-### 3. Online tools (GitHub Pages)
+### 3. Online time-sync page (GitHub Pages)
 
-The sync and flash pages are auto-deployed to GitHub Pages on every push to `main`:
+The sync page is auto-deployed as the GitHub Pages root on every push to `main`:
 
-- Landing page: <https://y2lin.github.io/AP_CyberClock/>
-- Time sync: <https://y2lin.github.io/AP_CyberClock/web-sync.html>
-- Offline flasher: <https://y2lin.github.io/AP_CyberClock/local-flasher.html>
+- <https://y2lin.github.io/AP_CyberClock/>
 
-HTTPS is required by Web Bluetooth / Web Serial, which GitHub Pages provides out of the box. The standalone files keep working offline as well. Note: `github.io` may be unreachable from mainland China; use the local files in that case.
+HTTPS is required by Web Bluetooth / Web Serial, which GitHub Pages provides out of the box. The standalone file keeps working offline as well. Note: `github.io` may be unreachable from mainland China; use the local file in that case.
 
 ## Repository layout
 
@@ -83,12 +81,10 @@ main/                          Firmware sources
 ├── time_manager.c/h           Time manager: NVS persistence, timezone, sync state
 └── (demo_* / bsp_* are upstream files)
 tools/
-├── cyber-clock-sync/          Sync & flash toolkit (also the Pages site root)
-│   ├── index.html             Online landing page
-│   ├── web-sync.html          Dual-channel sync page (BLE + Web Serial)
+├── cyber-clock-sync/          Sync toolkit (also the Pages site root)
+│   ├── index.html             Time-sync page (BLE + Web Serial), serves as the Pages home
 │   ├── usb-sync.py            CLI sync script (pyserial)
 │   ├── mac-sync.py            Mac system-Bluetooth sync script (bleak)
-│   ├── local-flasher.html     Browser offline flasher
 │   ├── firmware/              Prebuilt images (bootloader / partition table / app / merged)
 │   └── *.md                   Docs in Simplified Chinese: flashing guide, feature & sync manual, build info
 └── validate.sh and friends    Upstream build & check tooling
@@ -128,7 +124,7 @@ idf.py flash monitor
 
 ## GitHub Pages deployment
 
-`.github/workflows/pages.yml` deploys `tools/cyber-clock-sync/` (landing page, sync pages, flasher, firmware binaries, docs) to GitHub Pages whenever those files change on `main`. It can also be triggered manually ("Run workflow"). One-time setup: enable Pages in repository Settings -> Pages with **Source: GitHub Actions**.
+`.github/workflows/pages.yml` deploys `tools/cyber-clock-sync/` (the time-sync page as site root, plus firmware binaries and docs) to GitHub Pages whenever those files change on `main`. It can also be triggered manually ("Run workflow"). One-time setup: enable Pages in repository Settings -> Pages with **Source: GitHub Actions**.
 
 ## Acknowledgments & license
 

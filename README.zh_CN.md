@@ -54,26 +54,24 @@
 ## 快速开始
 
 ### 1. 刷固件
-预编译固件（v6）在 [`tools/cyber-clock-sync/`](tools/cyber-clock-sync/)：
-- `local-flasher.html`：浏览器离线刷机页（免安装工具）
+预编译固件（v6）在 [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/)：
+- 浏览器刷写（免安装）：Chrome/Edge 打开官方刷机页——FoloToy [官方刷机页](https://ai-passport.folotoy.cn/tools/web-flasher/)（厂商首选）或 [esptool-js](https://espressif.github.io/esptool-js/)（芯片厂商通用版），连接设备后添加合并固件、地址填 `0x0` 即可——固件直链下载：<https://y2lin.github.io/AP_CyberClock/firmware/FoloToy-AI-Passport-full.bin>
 - 或 esptool：`esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
 
 详见 [烧录指南](tools/cyber-clock-sync/烧录指南.md)。
 
 ### 2. 对时（三选一）
-- **USB 线（最简单）**：Chrome/Edge 打开 `web-sync.html` → "USB 线同步"标签页 → 连接 → 自动写入
+- **USB 线（最简单）**：Chrome/Edge 打开 `index.html`（本地或在线版，见下）→ "USB 线同步"标签页 → 连接 → 自动写入
 - **手机蓝牙**：nRF Connect / LightBlue 连接 `CyberClock`，向 FFC1 写入时间戳
-- **Mac 蓝牙**：`web-sync.html` 蓝牙标签页，或 `mac-sync.py` 脚本
+- **Mac 蓝牙**：`index.html` 蓝牙标签页，或 `mac-sync.py` 脚本
 
 同步协议、手动验证方法与故障排除见 [时钟功能与BLE同步说明](tools/cyber-clock-sync/时钟功能与BLE同步说明.md)。
 
-### 3. 在线工具（GitHub Pages）
+### 3. 在线对时页（GitHub Pages）
 
-对时页与刷机页在每次 push 到 `main` 后自动部署到 GitHub Pages：
+对时页在每次 push 到 `main` 后自动部署，就是 Pages 站点首页：
 
-- 导航页：<https://y2lin.github.io/AP_CyberClock/>
-- 时间同步：<https://y2lin.github.io/AP_CyberClock/web-sync.html>
-- 离线刷机：<https://y2lin.github.io/AP_CyberClock/local-flasher.html>
+- <https://y2lin.github.io/AP_CyberClock/>
 
 Web Bluetooth / Web Serial 要求 HTTPS 安全上下文，GitHub Pages 天然满足；离线单文件版也继续可用。注意：`github.io` 在中国大陆可能无法直接访问，此时请用本地文件。
 
@@ -87,12 +85,10 @@ main/                          固件源码
 ├── time_manager.c/h            时间管理：NVS 持久化、时区、同步状态
 └── (demo_* / bsp_* 为上游原有文件)
 tools/
-├── cyber-clock-sync/           对时与刷机工具包（同时是 Pages 站点根目录）
-│   ├── index.html              在线导航页
-│   ├── web-sync.html           双通道同步页（蓝牙 + Web Serial）
+├── cyber-clock-sync/           对时工具包（同时是 Pages 站点根目录）
+│   ├── index.html              双通道对时页（蓝牙 + Web Serial），即站点首页
 │   ├── usb-sync.py             USB 命令行同步脚本（pyserial）
 │   ├── mac-sync.py             Mac 系统蓝牙同步脚本（bleak）
-│   ├── local-flasher.html      浏览器离线刷机页
 │   ├── firmware/               预编译固件（bootloader/分区表/应用/合并）
 │   └── *.md                    中文文档：烧录指南、功能与同步说明、构建信息
 └── validate.sh 等              上游原有构建校验工具
@@ -130,7 +126,7 @@ idf.py flash monitor
 
 ## GitHub Pages 自动部署
 
-`.github/workflows/pages.yml` 在 `tools/cyber-clock-sync/` 内容变化（或手动触发）时，把该目录（导航页、同步页、刷机页、固件、文档）自动发布到 GitHub Pages。一次性设置：仓库 Settings → Pages，**Source 选择 "GitHub Actions"**。
+`.github/workflows/pages.yml` 在 `tools/cyber-clock-sync/` 内容变化（或手动触发）时，把该目录（对时页即站点首页、固件、文档）自动发布到 GitHub Pages。一次性设置：仓库 Settings → Pages，**Source 选择 "GitHub Actions"**。
 
 ## 致谢与许可
 
