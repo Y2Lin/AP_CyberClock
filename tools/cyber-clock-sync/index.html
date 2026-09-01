@@ -296,7 +296,14 @@ function log(msg, cls) {
 }
 
 function localTzHours() {
-  return -new Date().getTimezoneOffset() / 60;
+  // 协议时区单位为整数小时；半时区（如 +5.5）四舍五入，避免 BLE 侧截断 / USB 侧解析失败
+  return Math.round(-new Date().getTimezoneOffset() / 60);
+}
+
+/* 设备数据进入日志前转义（防 HTML 注入 / 排版破坏） */
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -370,16 +377,19 @@ function gattSerial(task) {
 let bleBusy = false;   // 写入进行中标志（防按钮重入）
 
 async function writeTime(dateObj, tzHours) {
-  if (!charWrite) return;
-  if (bleBusy) { log("上一次写入还在进行中，请稍候…", "warn"); return; }
+  if (!charWrite) return false;
+  if (bleBusy) { log("上一次写入还在进行中，请稍候…", "warn"); return false; }
   bleBusy = true;
   $("btnSyncNow").disabled = true;
   $("btnWriteCustom").disabled = true;
   const { buf, ts } = buildPayload(dateObj, tzHours);
+  const hintAutoOff = () =>
+    log("设备将在约 5 秒后自动断开并关闭蓝牙（v6 省电策略，正常现象）；再次同步请在设备上按 OK 键重开蓝牙", "info");
   try {
     await gattSerial(() => charWrite.writeValueWithResponse(buf));
     log(`已写入 FFC1：ts=${ts} tz=${tzHours}h`, "ok");
-    log("设备将在约 5 秒后自动断开并关闭蓝牙（v6 省电策略，正常现象）；再次同步请在设备上按 OK 键重开蓝牙", "info");
+    hintAutoOff();
+    return true;
   } catch (e) {
     // already-in-progress 说明有操作占线（不该发生，队列已串行化）；断开类错误不重试
     const disconnected = /disconnect/i.test(e.message || "");
@@ -389,10 +399,13 @@ async function writeTime(dateObj, tzHours) {
       try {
         await gattSerial(() => charWrite.writeValueWithoutResponse(buf));
         log(`已写入 FFC1（无响应模式）：ts=${ts} tz=${tzHours}h`, "ok");
+        hintAutoOff();
+        return true;
       } catch (e2) {
-        log(`写入失败：${e2.message}`, "err");
+        log(`写入失败：${esc(e2.message)}`, "err");
       }
     }
+    return false;
   } finally {
     bleBusy = false;
     if (device && device.gatt.connected) {
@@ -405,7 +418,7 @@ async function writeTime(dateObj, tzHours) {
 function onNotify(e) {
   const dv = e.target.value;
   const text = new TextDecoder().decode(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
-  log(`FFC2 通知：${text}`, "info");
+  log(`FFC2 通知：${esc(text)}`, "info");
   try {
     const st = JSON.parse(text);
     $("stTs").textContent = st.ts;
@@ -417,6 +430,8 @@ function onNotify(e) {
     // 非 JSON 帧忽略
   }
 }
+
+let manualDisconnect = false;   // 区分用户主动断开与设备自动断开（v6 省电）
 
 async function connect() {
   if (!navigator.bluetooth) {
@@ -434,9 +449,21 @@ async function connect() {
     log(useFilter
       ? "正在打开设备选择框（仅显示 CyberClock）…"
       : "正在打开设备选择框（显示全部设备）…在列表中找到设备并选中");
+    // BLE 设备同一时间只允许一个中心连接：换设备连接前先断开旧连接，否则旧连接占位导致连接失败
+    if (device && device.gatt && device.gatt.connected) {
+      manualDisconnect = true;
+      try { await device.gatt.disconnect(); } catch (_) {}
+      device = null;
+      log("已断开上一个 BLE 连接", "info");
+    }
     device = await navigator.bluetooth.requestDevice(opts);
     device.addEventListener("gattserverdisconnected", () => {
-      log("连接已断开（若刚同步成功，是设备约 5 秒后自动关蓝牙省电——属正常；再同步请在设备上按 OK 键重开蓝牙后重新连接）", "err");
+      if (manualDisconnect) {
+        log("已断开连接（手动）", "err");
+      } else {
+        log("连接已断开（若刚同步成功，是设备约 5 秒后自动关蓝牙省电——属正常；再同步请在设备上按 OK 键重开蓝牙后重新连接）", "err");
+      }
+      manualDisconnect = false;
       bleBusy = false;
       setConnected(false);
     });
@@ -461,14 +488,16 @@ async function connect() {
     await charNotify.startNotifications();
     charNotify.addEventListener("characteristicvaluechanged", onNotify);
     log("FFC1（写入）与 FFC2（通知）已就绪", "ok");
+    manualDisconnect = false;   // 新连接建立，清掉历史标志（兜底）
     setConnected(true, device.name || "");
 
     const tz = localTzHours();
     if (Number.isInteger(tz)) $("customTz").value = tz;
+    refreshPreviews();   // 时区输入框可能被更新，预览同步刷新
 
     if ($("autoSync").checked) {
-      await writeTime(new Date(), tz);
-      log("自动同步完成，等待设备状态通知…", "ok");
+      const ok = await writeTime(new Date(), tz);
+      log(ok ? "自动同步完成，等待设备状态通知…" : "自动同步未成功，可手动点击「立即同步」重试", ok ? "ok" : "err");
     }
   } catch (e) {
     if (e.name === "NotFoundError") {
@@ -481,8 +510,14 @@ async function connect() {
 }
 
 async function disconnect() {
+  manualDisconnect = true;   // 由 gattserverdisconnected 监听器消费并重置
   if (device && device.gatt.connected) {
     try { await device.gatt.disconnect(); } catch (e) { /* 忽略 */ }
+  } else {
+    manualDisconnect = false;
+    setConnected(false);
+    log("已断开连接");
+    return;
   }
   setConnected(false);
   log("已断开连接");
@@ -498,6 +533,7 @@ $("btnWriteCustom").addEventListener("click", async () => {
   if (!v) { log("请先选择自定义时间", "err"); return; }
   const tz = parseInt($("customTz").value, 10);
   if (Number.isNaN(tz) || tz < -14 || tz > 14) { log("时区范围为 -14 ~ +14 小时", "err"); return; }
+  if (!Number.isInteger(tz)) { log("时区仅支持整数小时（协议限制）", "err"); return; }
   await writeTime(new Date(v), tz);
 });
 $("customTime").addEventListener("change", refreshPreviews);
@@ -560,7 +596,7 @@ function usbFeedLine(line) {
   }
   if ($("usbShowRaw").checked) {
     const short = line.length > 110 ? line.slice(0, 110) + "…" : line;
-    log(short, "raw");
+    log(esc(short), "raw");
   }
 }
 
@@ -670,14 +706,20 @@ async function usbReconnect() {
   try {
     const ports = await navigator.serial.getPorts();
     if (!ports.length) { log("没有已授权的串口，请先点“连接 USB 设备”", "err"); return; }
+    // 多个授权端口时优先选 ESP32（VID 303A），避免连到其他设备
+    let port = ports[0];
+    for (const p of ports) {
+      const info = p.getInfo ? p.getInfo() : {};
+      if (info.usbVendorId === ESP_VID) { port = p; break; }
+    }
     log("尝试重新连接上次授权的串口…");
-    if (await usbOpenPort(ports[0])) {
+    if (await usbOpenPort(port)) {
       const tz = localTzHours();
       if (Number.isInteger(tz)) $("usbCustomTz").value = tz;
       if ($("autoUsbSync").checked) await usbWriteTime(new Date(), tz);
     }
   } catch (e) {
-    log(`USB 重连失败：${e.name || ""} ${e.message}`, "err");
+    log(`USB 重连失败：${esc(e.name || "")} ${esc(e.message)}`, "err");
     await usbClosePort();
   }
 }
@@ -698,31 +740,46 @@ function refreshUsbPreviews() {
   }
 }
 
+let usbBusy = false;   // 命令进行中标志：防止并发 T 命令响应互相错配
+
 async function usbWriteTime(dateObj, tzHours) {
-  if (!usbConnected) return;
-  const ts = Math.floor(dateObj.getTime() / 1000);
-  const local = dateObj.toLocaleString("zh-CN", { hour12: false });
-  const reply = await usbCmd(`T ${ts} ${tzHours}`, ["OK", "ERR"]);
-  if (reply && reply.startsWith("OK")) {
-    log(`对时成功：${reply}（本地 ${local}）`, "ok");
-  } else {
-    log(`对时失败：${reply || "设备无响应（超时）"}`, "err");
-    return;
-  }
-  // 回读状态
-  const st = await usbCmd("Q", ['{"ts"'], 3000);
-  if (st) {
-    try {
-      const j = JSON.parse(st);
-      $("ustTs").textContent = j.ts;
-      $("ustLocal").textContent = new Date((j.ts + j.tz) * 1000).toLocaleString("zh-CN", { hour12: false });
-      $("ustTz").textContent = `UTC${j.tz >= 0 ? "+" : ""}${j.tz / 3600}`;
-      $("ustSynced").textContent = j.synced ? "已同步 SYNCED" : "未同步 NO-SYNC";
-      $("ustSynced").className = "v " + (j.synced ? "ok" : "warn");
-      log(`设备状态：${st}`, "info");
-    } catch (err) { /* 非 JSON 忽略 */ }
-  } else {
-    log("状态回读超时（不影响已完成的对时，屏幕应在 1 秒内更新）", "info");
+  if (!usbConnected) return false;
+  if (usbBusy) { log("上一次 USB 命令还在进行中，请稍候…", "warn"); return false; }
+  usbBusy = true;
+  $("btnUsbSyncNow").disabled = true;
+  $("btnUsbWriteCustom").disabled = true;
+  try {
+    const ts = Math.floor(dateObj.getTime() / 1000);
+    const local = dateObj.toLocaleString("zh-CN", { hour12: false });
+    const reply = await usbCmd(`T ${ts} ${tzHours}`, ["OK", "ERR"]);
+    if (reply && reply.startsWith("OK")) {
+      log(`对时成功：${esc(reply)}（本地 ${local}）`, "ok");
+    } else {
+      log(`对时失败：${esc(reply || "设备无响应（超时）")}`, "err");
+      return false;
+    }
+    // 回读状态
+    const st = await usbCmd("Q", ['{"ts"'], 3000);
+    if (st) {
+      try {
+        const j = JSON.parse(st);
+        $("ustTs").textContent = j.ts;
+        $("ustLocal").textContent = new Date((j.ts + j.tz) * 1000).toLocaleString("zh-CN", { hour12: false });
+        $("ustTz").textContent = `UTC${j.tz >= 0 ? "+" : ""}${j.tz / 3600}`;
+        $("ustSynced").textContent = j.synced ? "已同步 SYNCED" : "未同步 NO-SYNC";
+        $("ustSynced").className = "v " + (j.synced ? "ok" : "warn");
+        log(`设备状态：${esc(st)}`, "info");
+      } catch (err) { /* 非 JSON 忽略 */ }
+    } else {
+      log("状态回读超时（不影响已完成的对时，屏幕应在 1 秒内更新）", "info");
+    }
+    return true;
+  } finally {
+    usbBusy = false;
+    if (usbConnected) {
+      $("btnUsbSyncNow").disabled = false;
+      $("btnUsbWriteCustom").disabled = false;
+    }
   }
 }
 
@@ -738,6 +795,7 @@ $("btnUsbWriteCustom").addEventListener("click", async () => {
   if (!v) { log("请先选择自定义时间", "err"); return; }
   const tz = parseInt($("usbCustomTz").value, 10);
   if (Number.isNaN(tz) || tz < -14 || tz > 14) { log("时区范围为 -14 ~ +14 小时", "err"); return; }
+  if (!Number.isInteger(tz)) { log("时区仅支持整数小时（协议限制）", "err"); return; }
   await usbWriteTime(new Date(v), tz);
 });
 $("usbCustomTime").addEventListener("change", refreshUsbPreviews);
@@ -750,6 +808,9 @@ if ("serial" in navigator) {
       log("USB 设备已拔出或端口消失", "err");
       usbKeepReading = false;
       usbPort = null;
+      usbBusy = false;
+      usbWaiters.forEach(w => { clearTimeout(w.timer); w.resolve(null); });   // 立即释放挂起的命令，不必等超时
+      usbWaiters = [];
       setUsbConnected(false);
     }
   });
@@ -757,6 +818,16 @@ if ("serial" in navigator) {
 
 /* ================= 初始化 ================= */
 refreshPreviews();
+// "立即同步"的 hex 预览需要实时反映当前时刻，每秒刷新（值变化才更新 DOM）
+let lastHexNowHtml = "";
+setInterval(() => {
+  const h = hexPreview(new Date(), localTzHours());
+  if (h !== lastHexNowHtml) {
+    lastHexNowHtml = h;
+    $("hexNow").innerHTML = h;
+    $("hexUsbNow").innerHTML = usbCmdPreview(new Date(), localTzHours());
+  }
+}, 1000);
 (function initCustom() {
   const now = new Date();
   now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
