@@ -1,91 +1,103 @@
+<p align="right">
+  <a href="README.zh_CN.md">简体中文</a> · <strong>English</strong>
+</p>
+
 # AP_CyberClock
 
-基于 [folotoy/ai-passport](https://github.com/folotoy/ai-passport)（MIT License）开发的**赛博朋克风格时钟**固件，运行于 FoloToy AI Passport 硬件（ESP32-C3）。
+A **cyberpunk-style clock** firmware for the FoloToy AI Passport (ESP32-C3), built on top of [folotoy/ai-passport](https://github.com/folotoy/ai-passport) (MIT License).
 
-支持 **BLE 蓝牙对时** 与 **USB 线对时** 双通道，内置蓝牙省电策略，无需配套 App——手机/Mac 浏览器网页或任意 BLE 调试工具即可完成时间同步。
+Supports **BLE** and **USB cable** time sync, with an automatic Bluetooth power-saving strategy. No companion app required — a browser page or any BLE debug tool is enough.
 
-![固件](https://img.shields.io/badge/firmware-v6-00f0ff) ![芯片](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
+![firmware](https://img.shields.io/badge/firmware-v6-00f0ff) ![chip](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
 
-## 功能特性
+## Features
 
-### 赛博朋克时钟 UI（240×320）
-- HUD 风格布局：四角 L 形角标、侧边刻度线、分割线装饰
-- 大字号 `HH:MM` + 右侧独立秒数 `SS`
-- 日期 + 星期 + 时区 + 运行时长
-- 底部电池条 + 百分比 + 电压，低电量红色告警
-- **4 套主题**：霓虹青紫 / 青绿单色 / 橙红暖色 / 矩阵绿
-- **2 种显示模式**：完整信息 / 精简（仅时间+日期+电池）
+### Cyberpunk clock UI (240x320)
+- HUD-style layout: corner brackets, side tick marks, divider lines
+- Large `HH:MM` digits with a separate `SS` seconds field
+- Date + weekday + timezone + uptime
+- Battery bar + percentage + voltage, low-battery warning in red
+- **4 themes**: neon cyan-purple / teal / amber / matrix green
+- **2 display modes**: full / minimal
 
-### BLE 蓝牙对时
-- 设备作为 BLE Peripheral 广播，名称 `CyberClock`
-- 自定义 GATT 服务（FFC0），写入 Unix 时间戳即可对时，支持时区
-- 连接后每 5 秒通知当前状态（JSON）
-- 支持重复配对（自动清除旧绑定），兼容 nRF Connect / LightBlue / Web Bluetooth
+### BLE time sync
+- Device advertises as `CyberClock` (BLE Peripheral)
+- Custom GATT service (`FFC0`): write a Unix timestamp to set the clock, timezone supported
+- Status notification every 5 s while connected (JSON)
+- Repeat pairing supported (stale bonds are cleared automatically); works with nRF Connect / LightBlue / Web Bluetooth
 
-### USB 线对时（v5+，免蓝牙）
-- 复用刷固件的 USB 数据线，走 ESP32-C3 USB Serial/JTAG
-- **任意页面可用**（含主菜单），不依赖进入时钟页面
-- 文本命令协议：`PING` / `T <unix> <tz>` / `Q`
-- 浏览器直连（Chrome/Edge Web Serial）或 `usb-sync.py` 命令行脚本
+### USB cable time sync (v5+, no Bluetooth)
+- Reuses the flashing USB cable via the ESP32-C3 USB Serial/JTAG port
+- Works on **any page** (including the main menu)
+- Text command protocol: `PING` / `T <unix> <tz>` / `Q`
+- Browser direct connect (Chrome/Edge Web Serial) or `usb-sync.py`
 
-### 蓝牙省电策略（v6+）
-- 时间未同步/不可信（含重启后）：进时钟页自动开广播等待同步
-- **同步成功（蓝牙或 USB 均算）约 5 秒后自动关蓝牙**：断连、停广播、释放协议栈
-- 已同步状态再进时钟页：蓝牙默认关闭
-- 短按 OK 键随时手动开关，屏幕右上角实时显示 `BT ADV / BT LINK / BT OFF`
+### Bluetooth power saving (v6+)
+- Time unreliable (never synced since boot, incl. after reboot): advertising starts automatically
+- **~5 s after a successful sync (BLE or USB), Bluetooth turns itself off** — disconnects, stops advertising, tears down the stack
+- Already synced: Bluetooth stays off when re-entering the clock page
+- Press OK to toggle at any time; the top bar shows `BT ADV / BT LINK / BT OFF`
 
-### 其他
-- 时间与时区持久化到 NVS，重启恢复粗略时间
-- LVGL 跨线程安全设计（BLE 回调仅置标志，UI 刷新全部在 LVGL 定时器上下文）
+### Misc
+- Time and timezone persisted to NVS, restored on boot (coarse)
+- LVGL thread safety: callbacks only set flags; UI refresh happens in the LVGL timer context
 
-## 按键操作（时钟页面）
+## Keys (clock page)
 
-| 按键 | 动作 | 功能 |
+| Key | Action | Function |
 |---|---|---|
-| UP | 短按 | 切换配色主题（青紫 → 青绿 → 橙红 → 矩阵绿） |
-| DOWN | 短按 | 切换显示模式（完整 ⇄ 精简） |
-| OK | 短按 | 手动开关蓝牙（右上角 `BT ADV` / `BT OFF`） |
-| OK | 长按 | 返回主菜单（系统统一拦截） |
+| UP | short | Cycle theme (neon cyan-purple -> teal -> amber -> matrix green) |
+| DOWN | short | Toggle display mode (full <-> minimal) |
+| OK | short | Toggle Bluetooth (`BT ADV` / `BT OFF` in the top bar) |
+| OK | long | Back to main menu (handled globally) |
 
-## 快速开始
+## Quick start
 
-### 1. 刷固件
-预编译固件在 `tools/cyber-clock-sync/firmware/`（v6）：
-- `local-flasher.html`：浏览器离线刷机页（免安装工具）
-- 或 esptool：`esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
+### 1. Flash the firmware
+Prebuilt binaries (v6) live in [`tools/cyber-clock-sync/`](tools/cyber-clock-sync/):
+- `local-flasher.html` — browser offline flasher (no toolchain needed), or
+- esptool: `esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
 
-详见 [`tools/cyber-clock-sync/烧录指南.md`](tools/cyber-clock-sync/烧录指南.md)。
+### 2. Set the time (pick one)
+- **USB cable (easiest)**: open `web-sync.html` in Chrome/Edge, switch to the "USB" tab, connect, done
+- **Phone Bluetooth**: connect to `CyberClock` with nRF Connect / LightBlue, write a timestamp to `FFC1`
+- **Mac Bluetooth**: `web-sync.html` BLE tab, or the `mac-sync.py` script
 
-### 2. 对时（三选一）
-- **USB 线（最简单）**：Chrome/Edge 打开 `tools/cyber-clock-sync/web-sync.html` → "USB 线同步"标签页 → 连接 → 自动写入
-- **手机蓝牙**：nRF Connect / LightBlue 连接 `CyberClock`，向 FFC1 写入时间戳
-- **Mac 蓝牙**：`web-sync.html` 蓝牙标签页，或 `mac-sync.py` 脚本
+### 3. Online tools (GitHub Pages)
 
-同步协议、手动验证方法与故障排除见 [`tools/cyber-clock-sync/时钟功能与BLE同步说明.md`](tools/cyber-clock-sync/时钟功能与BLE同步说明.md)。
+The sync and flash pages are auto-deployed to GitHub Pages on every push to `main`:
 
-## 目录结构
+- Landing page: <https://y2lin.github.io/AP_CyberClock/>
+- Time sync: <https://y2lin.github.io/AP_CyberClock/web-sync.html>
+- Offline flasher: <https://y2lin.github.io/AP_CyberClock/local-flasher.html>
+
+HTTPS is required by Web Bluetooth / Web Serial, which GitHub Pages provides out of the box. The standalone files keep working offline as well. Note: `github.io` may be unreachable from mainland China; use the local files in that case.
+
+## Repository layout
 
 ```
-main/                          固件源码
-├── cyber_clock.c/h            赛博朋克时钟 UI + 按键 + BLE 省电策略
-├── ble_time_sync.c/h          BLE GATT 时间同步服务
-├── usb_time_sync.c/h          USB Serial/JTAG 文本命令对时
-├── time_manager.c/h            时间管理：NVS 持久化、时区、同步状态
-└── (demo_* / bsp_* 为上游原有文件)
+main/                          Firmware sources
+├── cyber_clock.c/h            Cyberpunk clock UI + keys + BT power strategy
+├── ble_time_sync.c/h          BLE GATT time-sync service
+├── usb_time_sync.c/h          USB Serial/JTAG text-command time sync
+├── time_manager.c/h           Time manager: NVS persistence, timezone, sync state
+└── (demo_* / bsp_* are upstream files)
 tools/
-├── cyber-clock-sync/          对时与刷机工具包
-│   ├── web-sync.html          浏览器同步页（BLE + Web Serial 双通道）
-│   ├── usb-sync.py            USB 命令行同步脚本（pyserial）
-│   ├── mac-sync.py            Mac 系统蓝牙同步脚本（bleak）
-│   ├── local-flasher.html     浏览器离线刷机页
-│   ├── firmware/              预编译固件（bootloader/分区表/应用/合并）
-│   ├── 烧录指南.md
-│   ├── 时钟功能与BLE同步说明.md
-│   └── 构建信息.md            构建环境与固件 SHA256
-└── validate.sh 等             上游原有构建校验工具
+├── cyber-clock-sync/          Sync & flash toolkit (also the Pages site root)
+│   ├── index.html             Online landing page
+│   ├── web-sync.html          Dual-channel sync page (BLE + Web Serial)
+│   ├── usb-sync.py            CLI sync script (pyserial)
+│   ├── mac-sync.py            Mac system-Bluetooth sync script (bleak)
+│   ├── local-flasher.html     Browser offline flasher
+│   ├── firmware/              Prebuilt images (bootloader / partition table / app / merged)
+│   └── *.md                   Docs in Simplified Chinese: flashing guide, feature & sync manual, build info
+└── validate.sh and friends    Upstream build & check tooling
+.github/workflows/pages.yml    Pages auto-deploy (deploys tools/cyber-clock-sync)
 ```
 
-## 从源码构建
+Docs inside `tools/cyber-clock-sync/` are written in Simplified Chinese — browse [the directory](tools/cyber-clock-sync/) on GitHub to read them.
+
+## Build from source
 
 ```bash
 git clone https://github.com/Y2Lin/AP_CyberClock.git
@@ -98,23 +110,27 @@ idf.py build
 idf.py flash monitor
 ```
 
-- 8MB Flash，分区表 `partitions.csv`；应用分区上限 3MB
-- **不要修改** `cardid@0x356000` 与 `recovery@0x700000` 分区（小程序 BLE Recovery 依赖）
-- 干净构建校验：`./tools/validate.sh --firmware`（构建信息与 SHA256 见 `tools/cyber-clock-sync/构建信息.md`）
+- 8 MB flash, partition table in `partitions.csv`; the app partition limit is 3 MB
+- Do **not** modify the `cardid@0x356000` and `recovery@0x700000` partitions (required by the mini-program BLE recovery)
+- Clean-room build check: `./tools/validate.sh --firmware` (environment and SHA256 checksums in the build-info doc under `tools/cyber-clock-sync/`)
 
-## 对时协议速查
+## Protocol cheat sheet
 
-**BLE**（Service `FFC0`，Write `FFC1`，Notify `FFC2`）：向 FFC1 写 6 字节小端 = `uint32 Unix 时间戳 + int16 时区小时`，例如 `T 1788220800 UTC+8` → `00 53 D3 6A 08 00`。
+**BLE** (service `FFC0`, write `FFC1`, notify `FFC2`): write 6 little-endian bytes to `FFC1` = `uint32 Unix timestamp + int16 timezone hours`. Example `2026-09-01 00:00:00 UTC` + UTC+8 -> ts `1788220800` -> `80 15 96 6A 08 00`.
 
-**USB**（串口文本，换行结束）：
+**USB** (serial text, newline-terminated):
 
-| 发送 | 回复 |
+| Send | Reply |
 |---|---|
 | `PING` | `PONG` |
 | `T 1788220800 8` | `OK TS=1788220800 TZ=8` |
 | `Q` | `{"ts":1788220800,"tz":28800,"synced":true}` |
 
-## 致谢与许可
+## GitHub Pages deployment
 
-- 基于 [folotoy/ai-passport](https://github.com/folotoy/ai-passport) 开发，保留其完整提交历史以示致谢
-- 上游及本项目均采用 [MIT License](LICENSE)
+`.github/workflows/pages.yml` deploys `tools/cyber-clock-sync/` (landing page, sync pages, flasher, firmware binaries, docs) to GitHub Pages whenever those files change on `main`. It can also be triggered manually ("Run workflow"). One-time setup: enable Pages in repository Settings -> Pages with **Source: GitHub Actions**.
+
+## Acknowledgments & license
+
+- Built on [folotoy/ai-passport](https://github.com/folotoy/ai-passport); its full commit history is preserved as a tribute
+- Both upstream and this project use the [MIT License](LICENSE)
