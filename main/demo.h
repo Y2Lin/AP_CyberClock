@@ -32,3 +32,7 @@ void demo_ble_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 
 void demo_low_power_enter(void); void demo_low_power_exit(void);
 void demo_low_power_key(bsp_btn_t btn, bsp_btn_ev_t ev);
+
+// 赛博朋克时钟 + BLE 时间同步
+void demo_cyber_clock_enter(void); void demo_cyber_clock_exit(void);
+void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev);
