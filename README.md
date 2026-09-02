@@ -41,6 +41,7 @@ boot -> [TIME SYNC page]  --OK: go to clock (BT turns off)-->  [Clock face]
 - Works on **any page**
 - Text command protocol: `PING` / `T <unix> <tz>` / `Q`
 - Browser direct connect (Chrome/Edge Web Serial) or `usb-sync.py`
+- DTR/RTS are held deasserted during the session, so closing the page no longer resets the device (the C3's built-in download-reset path reads those line transitions as a reset pulse; v9.1 fix)
 
 ### Bluetooth lives on the sync page (v8/v9)
 - Entering the TIME SYNC page (boot first screen) starts advertising; leaving it stops Bluetooth entirely — the clock face never touches the radio

@@ -106,6 +106,15 @@ def main():
         print("若提示权限错误(Linux): sudo usermod -aG dialout $USER 后重新登录")
         sys.exit(1)
 
+    # 保持 RTS/DTR 常低,避免关闭串口时触发 ESP32-C3 内置 USB 复位逻辑
+    # (关闭端口时的电平回落会被芯片当作复位脉冲,表现为对时完设备重启)。
+    # 顺序必须先 RTS 后 DTR: 若先降 DTR 会出现 DTR=0 & RTS=1 的复位组合。
+    try:
+        ser.rts = False
+        ser.dtr = False
+    except Exception:
+        pass
+
     with ser:
         ser.reset_input_buffer()
 

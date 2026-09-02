@@ -249,6 +249,8 @@
           <b>固件要求 v5 及以上</b>（v4 及更早没有 USB 对时命令，PING 无响应时请先升级固件）。<br>
           浏览器占用串口期间 <b>无法烧录固件</b>（esptool 打不开端口），烧录前先点"断开"。<br>
           打开串口瞬间设备可能复位一次，属正常现象，页面会自动重试 PING。<br>
+          对时完成后<b>直接关闭本页面也不会重启设备</b>：页面已保持 DTR/RTS 常低，
+          不会触发芯片内置的下载复位通路（旧版页面关闭时设备会重启一次，升级本页即可）。<br>
           Windows 弹窗为空：本设备是 ESP32-C3 原生 USB（Win10/11 免驱），列表为空多为线是充电线；
           其他板子才需要 <a href="https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers" target="_blank" style="color:var(--cyan)">CP210x 驱动</a>。
         </div>
@@ -676,8 +678,14 @@ async function usbOpenPort(port) {
   usbLineBuf = "";
   usbKeepReading = true;
   await port.open({ baudRate: 115200, flowControl: "none" });
-  // 明确清掉 DTR/RTS，避免 USB Serial/JTAG 复位逻辑误触发
-  try { await port.setSignals({ dtr: false, rts: false }); } catch (_) {}
+  // 保持 DTR/RTS 常低：ESP32-C3 的 USB Serial/JTAG 会把主机断开/关闭端口时的
+  // DTR/RTS 电平变化解读为复位脉冲（与 esptool 刷机后的硬复位同一条通路）。
+  // 会话期间把两条线置低，之后无论关闭网页还是点"断开"，都不再产生电平
+  // 变化，设备就不会重启。注意字段名必须是 dataTerminalReady /
+  // requestToSend —— 写成 dtr/rts 会被 Web Serial 静默忽略（等于没设）。
+  try {
+    await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+  } catch (_) {}
   usbReadLoop(); // 后台读循环
   await sleep(300);
   log("串口已打开，探测固件（PING）…", "info");
@@ -697,6 +705,10 @@ async function usbClosePort() {
   usbKeepReading = false;
   usbWaiters.forEach(w => { clearTimeout(w.timer); w.resolve(null); });
   usbWaiters = [];
+  // 关闭前再压一次 DTR/RTS（防御性：万一中途被外部工具改动）
+  try {
+    if (usbPort) await usbPort.setSignals({ dataTerminalReady: false, requestToSend: false });
+  } catch (_) {}
   try { if (usbPort) await usbPort.close(); } catch (_) {}
   usbPort = null;
   setUsbConnected(false);
