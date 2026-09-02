@@ -1,94 +1,123 @@
---- orig-src/ai-passport/main/cyber_clock.c	2026-09-01 05:17:31.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/cyber_clock.c	2026-09-01 14:09:37.507215508 +0000
-@@ -21,6 +21,8 @@
- #include "bsp_button.h"
- #include "esp_log.h"
- #include "esp_timer.h"
-+#include "freertos/FreeRTOS.h"
-+#include "freertos/task.h"
- #include "lvgl.h"
- #include <string.h>
- #include <stdio.h>
-@@ -119,6 +121,7 @@
- static int s_batt_mv = 0;
- static int64_t s_enter_time;
- static bool s_ble_started = false;
-+static volatile bool s_sync_pending;   // BLE 同步事件标志（跨任务传递）
- 
- // 星期名称
- static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-@@ -370,7 +373,9 @@
-     localtime_r(&local, &tm);
- 
-     // HH:MM
--    char buf[16];
-+    // 48 字节：容纳各格式理论最大值（含 "NOT SYNCED UTC%+d" 23 字节、
-+    // 日期最坏 35 字节），避免 -Werror=format-truncation 与实际截断。
-+    char buf[48];
-     snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
-     lv_label_set_text(s_time_label, buf);
- 
-@@ -416,6 +421,15 @@
- static void tick(lv_timer_t *timer)
- {
-     (void)timer;
-+    // BLE 同步回调运行在 NimBLE host 任务：LVGL 非线程安全且彼时未持
-+    // bsp_lvgl 锁，直接调 update_time_display() 会与 LVGL 任务的渲染
-+    // 并发操作 LVGL 堆，导致死锁/堆损坏（表现为写入成功后整机卡死）。
-+    // 因此回调只置标志，在这里（LVGL 定时器上下文，已持锁）完成刷新。
-+    if (s_sync_pending) {
-+        s_sync_pending = false;
-+        s_last_sec = -1;   // 强制立即刷新显示
-+    }
+--- /dev/null
++++ b/main/ble_time_sync.c
+@@ -0,0 +1,493 @@
++// main/ble_time_sync.c —— 可连接 BLE GATT 时间同步服务。
++//
++// 与 demo_ble.c 的区别：demo_ble 只做不可连接广播（仅证明射频可用），
++// 本模块实现完整的 Peripheral + GATT，让手机/Mac 写入时间戳。
 +
-     time_t now = time_manager_get_unix_utc();
-     time_manager_state_t st = time_manager_get_state();
-     time_t local = now + st.tz_offset;
-@@ -437,8 +451,9 @@
- // ============================================================================
- static void on_ble_sync(void)
- {
-+    // 运行在 NimBLE host 任务中，禁止直接调用任何 LVGL API（见 tick() 内注释）。
-     ESP_LOGI(TAG, "BLE 时间同步完成");
--    update_time_display();
-+    s_sync_pending = true;
- }
- 
- // ============================================================================
-@@ -513,7 +528,7 @@
- // ============================================================================
- void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
- {
--    if (ev != BSP_BTN_EV_CLICK) return;
-+    if (ev != BSP_BTN_CLICK) return;
- 
-     switch (btn) {
-     case BSP_BTN_UP:
---- orig-src/ai-passport/main/ble_time_sync.c	2026-09-01 04:28:22.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/ble_time_sync.c	2026-09-01 13:34:24.523212568 +0000
-@@ -101,22 +101,31 @@
-     char name[32];
-     build_device_name(name, sizeof(name));
- 
++#include "ble_time_sync.h"
++#include "time_manager.h"
++#include "demo_radio.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "host/ble_gap.h"
++#include "host/ble_gatt.h"
++#include "host/ble_hs.h"
++#include "host/util/util.h"
++#include "nimble/nimble_port.h"
++#include "nimble/nimble_port_freertos.h"
++#include "os/os_mbuf.h"
++#include "services/gap/ble_svc_gap.h"
++#include "services/gatt/ble_svc_gatt.h"
++#include <string.h>
++#include <stdio.h>
++
++static const char *TAG = "ble_ts";
++
++// ---- UUID 定义（128 位，基础 UUID + 16 位短 ID）----
++#define GATT_TS_SERVICE_UUID      0xFFC0
++#define GATT_TS_CHAR_WRITE_UUID   0xFFC1
++#define GATT_TS_CHAR_NOTIFY_UUID  0xFFC2
++
++static const ble_uuid128_t s_svc_uuid =
++    BLE_UUID128_INIT(0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
++                     0x00, 0x10, 0x00, 0x00, 0xC0, 0xFF, 0x00, 0x00);
++static const ble_uuid128_t s_char_write_uuid =
++    BLE_UUID128_INIT(0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
++                     0x00, 0x10, 0x00, 0x00, 0xC1, 0xFF, 0x00, 0x00);
++static const ble_uuid128_t s_char_notify_uuid =
++    BLE_UUID128_INIT(0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
++                     0x00, 0x10, 0x00, 0x00, 0xC2, 0xFF, 0x00, 0x00);
++
++// ---- 全局状态 ----
++static ble_ts_state_t s_state = BLE_TS_DISCONNECTED;
++static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
++static uint16_t s_notify_handle;       // CCCD 句柄，用于判断客户端是否订阅
++static bool s_notify_enabled;
++static bool s_initialized;
++static bool s_start_requested;
++static uint8_t s_addr_type;
++static SemaphoreHandle_t s_host_stopped;
++static esp_timer_handle_t s_notify_timer;
++static ble_ts_sync_cb_t s_sync_cb;
++static char s_peer_name[32];
++
++#define DEVICE_NAME "CyberClock"
++
++// ---- 前向声明 ----
++static int gap_event(struct ble_gap_event *event, void *arg);
++static int gatt_svr_chr_write(uint16_t conn_handle, uint16_t attr_handle,
++                               struct ble_gatt_access_ctxt *ctxt, void *arg);
++static int gatt_svr_chr_read(uint16_t conn_handle, uint16_t attr_handle,
++                              struct ble_gatt_access_ctxt *ctxt, void *arg);
++
++// GATT 服务定义表
++static const struct ble_gatt_svc_def s_gatt_svcs[] = {
++    {
++        .type = BLE_GATT_SVC_TYPE_PRIMARY,
++        .uuid = &s_svc_uuid.u,
++        .characteristics = (struct ble_gatt_chr_def[]) {
++            {
++                // 写入特征：接收时间戳
++                .uuid = &s_char_write_uuid.u,
++                .access_cb = gatt_svr_chr_write,
++                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
++            },
++            {
++                // 通知特征：定期上报当前时间状态
++                .uuid = &s_char_notify_uuid.u,
++                .access_cb = gatt_svr_chr_read,
++                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
++                .val_handle = &s_notify_handle,
++            },
++            { 0 },  // 结束标记
++        },
++    },
++    { 0 },  // 服务结束
++};
++
++// ---- 工具：// 固定设备名，避免在 host 同步前读取 MAC 地址的时序问题。
++#define DEVICE_NAME "CyberClock"
++
++static void build_device_name(char *buf, size_t len)
++{
++    snprintf(buf, len, "%s", DEVICE_NAME);
++}
++
++// ---- 广播 ----
++static int start_advertising(void)
++{
++    struct ble_hs_adv_fields fields = {0};
++    char name[32];
++    build_device_name(name, sizeof(name));
++
 +    // 广播包上限 31 字节：flags(3) + "CyberClock"(12) + 128位UUID(18) = 33 字节超限，
 +    // ble_gap_adv_set_fields() 会返回 BLE_HS_EMSGSIZE，导致广播启动失败、手机扫描不到设备。
 +    // 因此设备名放广播包，128 位服务 UUID 放扫描响应包（nRF Connect 主动扫描时仍可见）。
-     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-     fields.name = (const uint8_t *)name;
-     fields.name_len = strlen(name);
-     fields.name_is_complete = 1;
- 
--    // 附加 128 位服务 UUID，方便客户端筛选
--    fields.uuids128 = (ble_uuid128_t *)&s_svc_uuid;
--    fields.num_uuids128 = 1;
--    fields.uuids128_is_complete = 1;
--
-     int rc = ble_gap_adv_set_fields(&fields);
-     if (rc != 0) {
-         ESP_LOGE(TAG, "设置广播数据失败: %d", rc);
-         return rc;
-     }
- 
++    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
++    fields.name = (const uint8_t *)name;
++    fields.name_len = strlen(name);
++    fields.name_is_complete = 1;
++
++    int rc = ble_gap_adv_set_fields(&fields);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "设置广播数据失败: %d", rc);
++        return rc;
++    }
++
 +    // 扫描响应包：附 128 位服务 UUID，方便客户端按 UUID 筛选
 +    struct ble_hs_adv_fields rsp_fields = {0};
 +    rsp_fields.uuids128 = (ble_uuid128_t *)&s_svc_uuid;
@@ -100,45 +129,174 @@
 +        return rc;
 +    }
 +
-     struct ble_gap_adv_params params = {0};
-     params.conn_mode = BLE_GAP_CONN_MODE_UND;   // 可连接（与 demo_ble 的 NON 不同）
-     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-@@ -267,20 +276,8 @@
-         ESP_LOGI(TAG, "广播结束");
-         break;
- 
--    default:
--        break;
--    }
--    return 0;
--}
--
--// ---- NimBLE host 回调 ----
--// 安全事件回调：自动接受所有配对请求（Just Works，无 MITM）
--static int on_sm_event(struct ble_gap_event *event, void *arg)
--{
--    (void)arg;
--    switch (event->type) {
-     case BLE_GAP_EVENT_PASSKEY_ACTION:
--        // Just Works 配对：直接回复确认
-+        // Just Works 配对：直接回复确认（SM 事件同样派发到 GAP 回调）
-         if (event->passkey.params.action == BLE_SM_IOACT_NONE) {
-             struct ble_sm_io pkey = {0};
-             pkey.action = event->passkey.params.action;
-@@ -288,19 +285,35 @@
-             ESP_LOGI(TAG, "Just Works 配对确认");
-         }
-         break;
++    struct ble_gap_adv_params params = {0};
++    params.conn_mode = BLE_GAP_CONN_MODE_UND;   // 可连接（与 demo_ble 的 NON 不同）
++    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
++    params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
++    params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
 +
-     case BLE_GAP_EVENT_ENC_CHANGE:
-         if (event->enc_change.status == 0) {
-             ESP_LOGI(TAG, "连接已加密");
-         } else {
--            ESP_LOGW(TAG, "加密失败: %d", event->enc_change.status);
++    rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER,
++                            &params, gap_event, NULL);
++    if (rc == 0) {
++        s_state = BLE_TS_ADVERTISING;
++        ESP_LOGI(TAG, "开始可连接广播: %s", name);
++    }
++    return rc;
++}
++
++// ---- GATT 写入回调：解析时间戳 ----
++static int gatt_svr_chr_write(uint16_t conn_handle, uint16_t attr_handle,
++                               struct ble_gatt_access_ctxt *ctxt, void *arg)
++{
++    (void)conn_handle; (void)attr_handle; (void)arg;
++    struct os_mbuf *om = ctxt->om;
++    if (!om) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
++
++    size_t len = OS_MBUF_PKTLEN(om);
++    if (len < 4) {
++        ESP_LOGW(TAG, "写入数据太短: %u 字节（需要至少 4 字节时间戳）", (unsigned)len);
++        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
++    }
++
++    uint8_t buf[16];
++    if (len > sizeof(buf)) len = sizeof(buf);
++    if (os_mbuf_copydata(om, 0, len, buf) != 0) {
++        return BLE_ATT_ERR_UNLIKELY;
++    }
++
++    // 小端解析 32 位 Unix 时间戳
++    uint32_t unix_utc = (uint32_t)buf[0]
++                       | ((uint32_t)buf[1] << 8)
++                       | ((uint32_t)buf[2] << 16)
++                       | ((uint32_t)buf[3] << 24);
++
++    ESP_LOGI(TAG, "收到时间戳: %u (0x%08X)", unix_utc, unix_utc);
++
++    if (time_manager_set_unix_utc((time_t)unix_utc) == ESP_OK) {
++        s_state = BLE_TS_SYNCED;
++        if (s_sync_cb) s_sync_cb();
++    }
++
++    // 可选：第 5-6 字节为时区偏移（int16 小端，单位：小时）
++    if (len >= 6) {
++        int16_t tz_hours = (int16_t)(buf[4] | ((uint16_t)buf[5] << 8));
++        time_manager_set_timezone((int32_t)tz_hours * 3600);
++        ESP_LOGI(TAG, "收到时区偏移: %d 小时", tz_hours);
++    }
++
++    return 0;
++}
++
++// ---- GATT 读取回调：返回当前状态 JSON ----
++static int gatt_svr_chr_read(uint16_t conn_handle, uint16_t attr_handle,
++                              struct ble_gatt_access_ctxt *ctxt, void *arg)
++{
++    (void)conn_handle; (void)attr_handle; (void)arg;
++    time_manager_state_t st = time_manager_get_state();
++    char json[96];
++    int n = snprintf(json, sizeof(json),
++                      "{\"ts\":%ld,\"tz\":%ld,\"synced\":%s}",
++                      (long)time_manager_get_unix_utc(),
++                      (long)st.tz_offset,
++                      st.synced ? "true" : "false");
++    return os_mbuf_append(ctxt->om, json, n);
++}
++
++// ---- 通知定时器：每 5 秒发送一次状态 ----
++static void notify_task(void *arg)
++{
++    (void)arg;
++    if (s_state != BLE_TS_CONNECTED && s_state != BLE_TS_SYNCED) return;
++    if (!s_notify_enabled || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
++
++    time_manager_state_t st = time_manager_get_state();
++    char json[96];
++    int n = snprintf(json, sizeof(json),
++                      "{\"ts\":%ld,\"tz\":%ld,\"synced\":%s}",
++                      (long)time_manager_get_unix_utc(),
++                      (long)st.tz_offset,
++                      st.synced ? "true" : "false");
++
++    struct os_mbuf *om = ble_hs_mbuf_from_flat(json, n);
++    if (om) {
++        ble_gattc_notify_custom(s_conn_handle, s_notify_handle, om);
++    }
++}
++
++// ---- GAP 事件回调 ----
++static int gap_event(struct ble_gap_event *event, void *arg)
++{
++    (void)arg;
++    switch (event->type) {
++    case BLE_GAP_EVENT_CONNECT:
++        if (event->connect.status == 0) {
++            s_conn_handle = event->connect.conn_handle;
++            s_state = BLE_TS_CONNECTED;
++            // 记录对端地址
++            struct ble_gap_conn_desc desc;
++            if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
++                ble_addr_t *addr = &desc.peer_id_addr;
++                snprintf(s_peer_name, sizeof(s_peer_name), "%02X:%02X:%02X:%02X:%02X:%02X",
++                         addr->val[5], addr->val[4], addr->val[3],
++                         addr->val[2], addr->val[1], addr->val[0]);
++            } else {
++                snprintf(s_peer_name, sizeof(s_peer_name), "unknown");
++            }
++            ESP_LOGI(TAG, "已连接: %s", s_peer_name);
++            // 启动通知定时器
++            esp_timer_start_periodic(s_notify_timer, 5000000);  // 5 秒
++        } else {
++            ESP_LOGW(TAG, "连接失败: %d", event->connect.status);
++            s_state = BLE_TS_ADVERTISING;
++            start_advertising();  // 重新广播
++        }
++        break;
++
++    case BLE_GAP_EVENT_DISCONNECT:
++        ESP_LOGI(TAG, "断开连接: reason=%d", event->disconnect.reason);
++        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
++        s_notify_enabled = false;
++        s_peer_name[0] = '\0';
++        esp_timer_stop(s_notify_timer);
++        // 重新开始广播，等待下一次连接
++        s_state = BLE_TS_ADVERTISING;
++        start_advertising();
++        break;
++
++    case BLE_GAP_EVENT_SUBSCRIBE:
++        // 客户端订阅/取消通知特征
++        s_notify_enabled = (event->subscribe.cur_notify == 1);
++        ESP_LOGI(TAG, "客户端订阅通知: %s", s_notify_enabled ? "开启" : "关闭");
++        break;
++
++    case BLE_GAP_EVENT_MTU:
++        ESP_LOGI(TAG, "MTU 更新: conn=%d mtu=%d",
++                 event->mtu.conn_handle, event->mtu.value);
++        break;
++
++    case BLE_GAP_EVENT_ADV_COMPLETE:
++        // 广播停止（通常因为被连接），不需要重新启动
++        ESP_LOGI(TAG, "广播结束");
++        break;
++
++    case BLE_GAP_EVENT_PASSKEY_ACTION:
++        // Just Works 配对：直接回复确认（SM 事件同样派发到 GAP 回调）
++        if (event->passkey.params.action == BLE_SM_IOACT_NONE) {
++            struct ble_sm_io pkey = {0};
++            pkey.action = event->passkey.params.action;
++            ble_sm_inject_io(event->passkey.conn_handle, &pkey);
++            ESP_LOGI(TAG, "Just Works 配对确认");
++        }
++        break;
++
++    case BLE_GAP_EVENT_ENC_CHANGE:
++        if (event->enc_change.status == 0) {
++            ESP_LOGI(TAG, "连接已加密");
++        } else {
 +            // 手机端持有旧绑定密钥与本设备失配：手机随后会重新发起配对
 +            ESP_LOGW(TAG, "加密失败(旧密钥失配?): %d", event->enc_change.status);
-         }
-         break;
++        }
++        break;
 +
 +    case BLE_GAP_EVENT_REPEAT_PAIRING: {
 +        // 手机端已丢绑定而本设备仍存有旧记录（或反之）时，手机发起的
@@ -152,71 +310,370 @@
 +        return BLE_GAP_REPEAT_PAIRING_RETRY;
 +    }
 +
-     default:
-         break;
-     }
-     return 0;
- }
- 
++    default:
++        break;
++    }
++    return 0;
++}
++
 +// ---- NimBLE host 回调 ----
- static void on_reset(int reason)
- {
-     ESP_LOGE(TAG, "NimBLE host reset: %d", reason);
-@@ -397,10 +410,13 @@
-     ble_hs_cfg.sm_sc = 1;
-     ble_hs_cfg.sm_keypress = 0;
-     ble_hs_cfg.sm_oob_data_flag = 0;
--    ble_hs_cfg.sm_event_cb = on_sm_event;
++static void on_reset(int reason)
++{
++    ESP_LOGE(TAG, "NimBLE host reset: %d", reason);
++    s_state = BLE_TS_ERROR;
++}
++
++static void on_sync(void)
++{
++    int rc = ble_hs_util_ensure_addr(0);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "ensure_addr 失败: %d", rc);
++        s_state = BLE_TS_ERROR;
++        return;
++    }
++    rc = ble_hs_id_infer_auto(0, &s_addr_type);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "infer_addr 失败: %d", rc);
++        s_state = BLE_TS_ERROR;
++        return;
++    }
++    if (s_start_requested) {
++        rc = start_advertising();
++        if (rc != 0) {
++            ESP_LOGE(TAG, "启动广播失败: %d", rc);
++            s_state = BLE_TS_ERROR;
++        }
++    }
++}
++
++static void host_task(void *arg)
++{
++    (void)arg;
++    nimble_port_run();
++    if (s_host_stopped) xSemaphoreGive(s_host_stopped);
++    nimble_port_freertos_deinit();
++}
++
++// ---- 公共 API ----
++
++esp_err_t ble_time_sync_start(void)
++{
++    if (s_initialized) {
++        ESP_LOGW(TAG, "已在运行中");
++        return ESP_ERR_INVALID_STATE;
++    }
++
++    s_state = BLE_TS_DISCONNECTED;
++    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
++    s_notify_enabled = false;
++    s_peer_name[0] = '\0';
++
++    esp_err_t err = demo_radio_nvs_prepare();
++    if (err != ESP_OK) return err;
++
++    err = nimble_port_init();
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "nimble_port_init 失败: %s", esp_err_to_name(err));
++        return err;
++    }
++    s_initialized = true;
++
++    s_host_stopped = xSemaphoreCreateBinary();
++    if (!s_host_stopped) {
++        nimble_port_deinit();
++        s_initialized = false;
++        return ESP_ERR_NO_MEM;
++    }
++
++    ble_svc_gap_init();
++    ble_svc_gatt_init();
++
++    // 注册自定义 GATT 服务（必须在标准服务初始化之后）
++    int rc = ble_gatts_count_cfg(s_gatt_svcs);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "ble_gatts_count_cfg 失败: %d", rc);
++        goto fail;
++    }
++    rc = ble_gatts_add_svcs(s_gatt_svcs);
++    if (rc != 0) {
++        ESP_LOGE(TAG, "ble_gatts_add_svcs 失败: %d", rc);
++        goto fail;
++    }
++
++    char name[32];
++    // 注意：设备名在 on_sync 时才知道 MAC，这里先用基础名，广播时会用完整名
++    snprintf(name, sizeof(name), "%s", DEVICE_NAME);
++    ble_svc_gap_device_name_set(name);
++
++    // BLE 安全配置：Just Works 配对，不绑定，不需要 MITM
++    // 避免 iOS/Mac 连接时卡在配对流程
++    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
++    ble_hs_cfg.sm_bonding = 0;
++    ble_hs_cfg.sm_mitm = 0;
++    ble_hs_cfg.sm_sc = 1;
++    ble_hs_cfg.sm_keypress = 0;
++    ble_hs_cfg.sm_oob_data_flag = 0;
 +    // SM 事件（PASSKEY_ACTION / ENC_CHANGE）经 GAP 回调 gap_event() 派发，
 +    // 本版本 NimBLE 的 ble_hs_cfg 无 sm_event_cb 成员。
- 
-     ble_hs_cfg.reset_cb = on_reset;
-     ble_hs_cfg.sync_cb = on_sync;
++
++    ble_hs_cfg.reset_cb = on_reset;
++    ble_hs_cfg.sync_cb = on_sync;
 +    // 绑定存储写满时按 round-robin 淘汰最旧记录，避免后续配对失败
 +    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
- 
-     // 创建通知定时器
-     esp_timer_create_args_t timer_args = {
-
-===================================================================
-v5：USB 串口对时（新增 usb_time_sync 模块 + main/CMake 接线）
-===================================================================
---- orig-src/ai-passport/main/main.c	2026-08-31 19:17:53.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/main.c	2026-09-01 15:26:34.050598128 +0000
-@@ -15,6 +15,8 @@
- #include "lvgl.h"
- #include "esp_log.h"
- #include "esp_sleep.h"
-+#include "time_manager.h"
-+#include "usb_time_sync.h"
- 
- static const char *TAG = "main";
- 
-@@ -114,6 +116,10 @@
-     bsp_i2c_init();
-     bsp_i2c_scan();
- 
-+    // 时间管理 + USB 串口对时(常驻,任意页面可用,不依赖蓝牙)
-+    time_manager_init();
-+    usb_time_sync_start();
 +
-     // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-     // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
-     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
---- orig-src/ai-passport/main/CMakeLists.txt	2026-08-31 19:17:57.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/CMakeLists.txt	2026-09-01 15:26:17.535313507 +0000
-@@ -12,7 +12,8 @@
-          "demo_low_power.c"
-          "time_manager.c"
-          "ble_time_sync.c"
-+         "usb_time_sync.c"
-          "cyber_clock.c"
-     INCLUDE_DIRS "."
--    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
-+    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash esp_driver_usb_serial_jtag
- )
---- /dev/null	2026-09-01 13:01:24.681002814 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/usb_time_sync.c	2026-09-01 15:26:11.662296683 +0000
++    // 创建通知定时器
++    esp_timer_create_args_t timer_args = {
++        .callback = notify_task,
++        .name = "ble_ts_notify",
++    };
++    if (esp_timer_create(&timer_args, &s_notify_timer) != ESP_OK) {
++        ESP_LOGE(TAG, "创建通知定时器失败");
++        goto fail;
++    }
++
++    s_start_requested = true;
++    nimble_port_freertos_init(host_task);
++    ESP_LOGI(TAG, "BLE 时间同步服务已启动");
++    return ESP_OK;
++
++fail:
++    if (s_host_stopped) { vSemaphoreDelete(s_host_stopped); s_host_stopped = NULL; }
++    nimble_port_deinit();
++    s_initialized = false;
++    return ESP_FAIL;
++}
++
++void ble_time_sync_stop(void)
++{
++    if (!s_initialized) return;
++    s_start_requested = false;
++
++    if (s_notify_timer) {
++        esp_timer_stop(s_notify_timer);
++        esp_timer_delete(s_notify_timer);
++        s_notify_timer = NULL;
++    }
++
++    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
++        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
++    }
++    ble_gap_adv_stop();
++
++    int rc = nimble_port_stop();
++    if (rc == 0 && s_host_stopped) {
++        xSemaphoreTake(s_host_stopped, portMAX_DELAY);
++    }
++    if (rc == 0) {
++        nimble_port_deinit();
++        s_initialized = false;
++    } else {
++        ESP_LOGE(TAG, "nimble_port_stop 失败: %d", rc);
++    }
++
++    if (s_host_stopped) {
++        vSemaphoreDelete(s_host_stopped);
++        s_host_stopped = NULL;
++    }
++
++    s_state = BLE_TS_DISCONNECTED;
++    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
++    ESP_LOGI(TAG, "BLE 时间同步服务已停止");
++}
++
++ble_ts_state_t ble_time_sync_get_state(void)
++{
++    return s_state;
++}
++
++const char *ble_time_sync_peer_name(void)
++{
++    return s_peer_name[0] ? s_peer_name : "---";
++}
++
++void ble_time_sync_set_sync_callback(ble_ts_sync_cb_t cb)
++{
++    s_sync_cb = cb;
++}
+--- /dev/null
++++ b/main/time_manager.c
+@@ -0,0 +1,175 @@
++// main/time_manager.c —— 系统时间管理：NVS 持久化、时区、同步状态。
++#include "time_manager.h"
++#include "demo_radio.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "nvs_flash.h"
++#include "nvs.h"
++#include <string.h>
++#include <sys/time.h>
++
++static const char *TAG = "time_mgr";
++
++#define NVS_NAMESPACE  "cyber_clk"
++#define NVS_KEY_STATE  "state"
++#define NVS_KEY_TZ     "tz_offset"
++#define NVS_KEY_LAST   "last_unix"
++
++static time_manager_state_t s_state;
++static bool s_initialized;
++
++// 把状态写入 NVS。失败只打日志，不阻塞 UI。
++static void persist_state(void)
++{
++    nvs_handle_t h;
++    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
++    nvs_set_blob(h, NVS_KEY_STATE, &s_state, sizeof(s_state));
++    nvs_commit(h);
++    nvs_close(h);
++}
++
++esp_err_t time_manager_init(void)
++{
++    if (s_initialized) return ESP_OK;
++
++    // NVS 是时间持久化的前提；demo_radio_nvs_prepare 不会擦除用户数据。
++    esp_err_t err = demo_radio_nvs_prepare();
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "NVS 不可用，时间无法持久化: %s", esp_err_to_name(err));
++        // 即使 NVS 失败也继续，至少内存中的时间可用。
++    }
++
++    memset(&s_state, 0, sizeof(s_state));
++    s_state.tz_offset = 28800;  // 默认东八区
++
++    nvs_handle_t h;
++    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
++        size_t len = sizeof(s_state);
++        nvs_get_blob(h, NVS_KEY_STATE, &s_state, &len);
++        int32_t tz = 0;
++        if (nvs_get_i32(h, NVS_KEY_TZ, &tz) == ESP_OK && tz != 0) {
++            s_state.tz_offset = tz;
++        }
++        // 尝试恢复上次保存的 Unix 时间作为粗略起点。
++        // 注意：深度睡眠期间 RTC 定时器仍在跑，但系统时间会重置，
++        // 所以这里恢复的值仅用于"未同步时显示一个大概时间"。
++        int64_t last_unix = 0;
++        if (nvs_get_i64(h, NVS_KEY_LAST, &last_unix) == ESP_OK && last_unix > 1700000000) {
++            struct timeval tv = { .tv_sec = (time_t)last_unix, .tv_usec = 0 };
++            settimeofday(&tv, NULL);
++            ESP_LOGI(TAG, "从 NVS 恢复粗略时间: %lld", (long long)last_unix);
++        }
++        nvs_close(h);
++    }
++
++    // 重启检测：本机没有 RTC 电池，断电/深度睡眠后 esp_timer 归零。
++    // 若上次同步时刻"在未来"（last_sync_ms > 当前单调钟），说明发生了重启——
++    // 当前时间只是 NVS 恢复的粗略旧值，不可信。如实清除 synced 标志并持久化，
++    // 让 UI / BLE 通知 / USB Q 命令都显示未同步（v6 省电策略亦据此自动开广播等待对时）。
++    if (s_state.synced &&
++        s_state.last_sync_ms > esp_timer_get_time() / 1000) {
++        s_state.synced = false;
++        persist_state();
++        ESP_LOGI(TAG, "检测到重启：恢复的时间不可信，synced 已清除（等待重新同步）");
++    }
++
++    s_initialized = true;
++    ESP_LOGI(TAG, "初始化完成: synced=%d tz=%ld sync_count=%u",
++             s_state.synced, (long)s_state.tz_offset, s_state.sync_count);
++    return ESP_OK;
++}
++
++esp_err_t time_manager_set_unix_utc(time_t unix_seconds)
++{
++    if (!s_initialized) time_manager_init();
++
++    struct timeval tv = { .tv_sec = unix_seconds, .tv_usec = 0 };
++    esp_err_t err = settimeofday(&tv, NULL);
++    if (err != 0) {
++        ESP_LOGE(TAG, "settimeofday 失败: %d", err);
++        return ESP_FAIL;
++    }
++
++    s_state.synced = true;
++    s_state.sync_count++;
++    s_state.last_sync_ms = esp_timer_get_time() / 1000;
++
++    // 持久化：状态 + 当前时间（供下次启动粗略恢复）。
++    nvs_handle_t h;
++    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
++        nvs_set_blob(h, NVS_KEY_STATE, &s_state, sizeof(s_state));
++        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)unix_seconds);
++        nvs_commit(h);
++        nvs_close(h);
++    }
++
++    ESP_LOGI(TAG, "时间已同步: UTC=%lld, 本地同步次数=%u",
++             (long long)unix_seconds, s_state.sync_count);
++    return ESP_OK;
++}
++
++esp_err_t time_manager_set_timezone(int32_t offset_seconds)
++{
++    if (!s_initialized) time_manager_init();
++    s_state.tz_offset = offset_seconds;
++    persist_state();
++
++    nvs_handle_t h;
++    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
++        nvs_set_i32(h, NVS_KEY_TZ, offset_seconds);
++        nvs_commit(h);
++        nvs_close(h);
++    }
++    return ESP_OK;
++}
++
++time_t time_manager_get_unix_utc(void)
++{
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++    return tv.tv_sec;
++}
++
++struct tm time_manager_get_local(void)
++{
++    time_t now = time_manager_get_unix_utc() + s_state.tz_offset;
++    struct tm tm;
++    gmtime_r(&now, &tm);  // 用 gmtime_r 处理已加偏移的时间，避免系统 TZ 干扰
++    return tm;
++}
++
++time_manager_state_t time_manager_get_state(void)
++{
++    return s_state;
++}
++
++bool time_manager_is_reliable(uint32_t max_age_seconds)
++{
++    if (!s_state.synced) return false;
++    int64_t now_ms = esp_timer_get_time() / 1000;
++    int64_t elapsed = (now_ms - s_state.last_sync_ms) / 1000;
++    return elapsed >= 0 && (uint32_t)elapsed <= max_age_seconds;
++}
++
++void time_manager_format_hms(char *buf, size_t buf_size)
++{
++    if (!buf || buf_size < 9) return;
++    struct tm tm = time_manager_get_local();
++    snprintf(buf, buf_size, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
++}
++
++void time_manager_format_ymd(char *buf, size_t buf_size)
++{
++    if (!buf || buf_size < 11) return;
++    struct tm tm = time_manager_get_local();
++    snprintf(buf, buf_size, "%04d-%02d-%02d",
++             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
++}
++
++void time_manager_format_weekday(char *buf, size_t buf_size)
++{
++    if (!buf || buf_size < 4) return;
++    static const char *names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
++    struct tm tm = time_manager_get_local();
++    snprintf(buf, buf_size, "%s", names[tm.tm_wday]);
++}
+--- /dev/null
++++ b/main/usb_time_sync.c
 @@ -0,0 +1,131 @@
 +// main/usb_time_sync.c —— USB 串口对时(免蓝牙方案)。
 +//
@@ -349,8 +806,8 @@ v5：USB 串口对时（新增 usb_time_sync 模块 + main/CMake 接线）
 +    ESP_LOGI(TAG, "USB 串口对时已就绪");
 +    return ESP_OK;
 +}
---- /dev/null	2026-09-01 13:01:24.681002814 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/usb_time_sync.h	2026-09-01 15:25:51.325479582 +0000
+--- /dev/null
++++ b/main/usb_time_sync.h
 @@ -0,0 +1,11 @@
 +// main/usb_time_sync.h —— USB 串口对时(免蓝牙方案)。
 +#pragma once
@@ -363,581 +820,241 @@ v5：USB 串口对时（新增 usb_time_sync 模块 + main/CMake 接线）
 +//   Q                        -> {"ts":...,"tz":...,"synced":true}
 +//   其他                     -> ERR UNKNOWN
 +esp_err_t usb_time_sync_start(void);
-
-===================================================================
-v6：BLE 省电策略（cyber_clock.c 相对上游的最终累计 diff，含 v4 修复与 v6 策略）
-===================================================================
---- orig-src/ai-passport/main/cyber_clock.c	2026-09-01 05:17:31.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/cyber_clock.c	2026-09-01 15:59:13.284199148 +0000
-@@ -12,8 +12,15 @@
- // 交互：
- //   UP   短按：切换配色主题
- //   DOWN 短按：切换显示模式（精简/完整）
--//   OK   短按：手动重启 BLE 广播
-+//   OK   短按：手动开关 BLE 广播
- //   OK   长按：返回菜单
-+//
-+// BLE 功耗策略（v6）：
-+//   - 进入时钟页时，仅当"时间不可信"（本次开机未同步过）才自动开启广播
-+//   - 同步成功（无论 BLE 还是 USB 写入）5 秒后自动关闭广播与连接（省电）；
-+//     延迟 5 秒是为了让对端收完最终状态通知、并留出回读时间
-+//   - OK 短按随时手动开/关，手动开启后不会被打断，直到下一次新的同步事件
-+//   - 顶部状态栏 BT 指示当前蓝牙状态（ADV=广播中 / LINK=已连接 / OFF=已关闭）
- #include "cyber_clock.h"
- #include "time_manager.h"
- #include "ble_time_sync.h"
-@@ -21,6 +28,8 @@
- #include "bsp_button.h"
- #include "esp_log.h"
- #include "esp_timer.h"
-+#include "freertos/FreeRTOS.h"
-+#include "freertos/task.h"
+--- a/main/main.c
++++ b/main/main.c
+@@ -15,10 +15,13 @@
  #include "lvgl.h"
- #include <string.h>
- #include <stdio.h>
-@@ -119,6 +128,17 @@
- static int s_batt_mv = 0;
- static int64_t s_enter_time;
- static bool s_ble_started = false;
-+static volatile bool s_sync_pending;   // BLE 同步事件标志（跨任务传递）
-+static lv_obj_t *s_bt_label;           // 顶部蓝牙状态文字
-+static uint32_t s_last_sync_count;     // 上次看到的同步计数（新同步事件边沿检测）
-+static int64_t  s_ble_off_deadline_ms; // >0：到点自动关闭 BLE
-+static int      s_bt_disp_state = -1;  // 状态栏 BT 显示缓存（-1 强制刷新）
-+
-+// 同步成功后延迟关 BLE：给对端留出收最终 FFC2 通知 / 回读状态的时间
-+#define BLE_AUTO_OFF_DELAY_MS   5000
-+// "时间可信"判定窗口：本次开机内 1 小时内同步过即可信（重启后单调钟归零，
-+// last_sync_ms 反而变大 → elapsed 为负 → 不可信 → 自动开广播等待重新同步）
-+#define BLE_RELIABLE_WINDOW_S   3600
- 
- // 星期名称
- static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-@@ -255,6 +275,12 @@
-     // 顶部电池图标（右移，因为去掉了百分比文字）
-     s_batt_icon_top = make_rect(s_scr, 210, 13, 14, 7, t->battery_ok);
-     make_rect(s_scr, 224, 15, 2, 3, t->battery_ok);
-+    // 蓝牙状态文字（电池图标左侧）
-+    s_bt_label = lv_label_create(s_scr);
-+    lv_obj_set_pos(s_bt_label, 150, 10);
-+    lv_label_set_text(s_bt_label, "BT OFF");
-+    lv_obj_set_style_text_font(s_bt_label, &lv_font_montserrat_14, 0);
-+    set_text_color(s_bt_label, t->text_dim);
- 
-     // ---- 时间区域 (y=50-170) ----
-     // 大号 HH:MM 偏左
-@@ -339,6 +365,33 @@
- }
- 
- // ============================================================================
-+// 蓝牙状态栏指示：OFF / ADV / LINK（带缓存，状态不变不重绘）
-+// ============================================================================
-+static void bt_status_update(void)
-+{
-+    if (!s_bt_label) return;
-+    const cyber_theme_t *t = &THEMES[s_theme_idx];
-+    int st;
-+    const char *text;
-+    uint32_t color;
-+    if (!s_ble_started) {
-+        st = 0; text = "BT OFF"; color = t->text_dim;
-+    } else {
-+        ble_ts_state_t bs = ble_time_sync_get_state();
-+        if (bs == BLE_TS_CONNECTED || bs == BLE_TS_SYNCED) {
-+            st = 2; text = "BT LINK"; color = t->battery_ok;
-+        } else {
-+            st = 1; text = "BT ADV"; color = t->primary;
-+        }
-+    }
-+    if (st != s_bt_disp_state) {
-+        s_bt_disp_state = st;
-+        lv_label_set_text(s_bt_label, text);
-+        set_text_color(s_bt_label, color);
-+    }
-+}
-+
-+// ============================================================================
- // 主题应用
- // ============================================================================
- static void apply_theme(void)
-@@ -355,6 +408,8 @@
-     lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
-     lv_obj_set_style_bg_color(s_divider1, lv_color_hex(t->hud_line), 0);
-     lv_obj_set_style_bg_color(s_divider2, lv_color_hex(t->hud_line), 0);
-+    s_bt_disp_state = -1;   // 强制按新主题重绘 BT 状态
-+    bt_status_update();
-     battery_update();
- }
- 
-@@ -370,7 +425,9 @@
-     localtime_r(&local, &tm);
- 
-     // HH:MM
--    char buf[16];
-+    // 48 字节：容纳各格式理论最大值（含 "NOT SYNCED UTC%+d" 23 字节、
-+    // 日期最坏 35 字节），避免 -Werror=format-truncation 与实际截断。
-+    char buf[48];
-     snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
-     lv_label_set_text(s_time_label, buf);
- 
-@@ -416,12 +473,45 @@
- static void tick(lv_timer_t *timer)
- {
-     (void)timer;
-+    // BLE 同步回调运行在 NimBLE host 任务：LVGL 非线程安全且彼时未持
-+    // bsp_lvgl 锁，直接调 update_time_display() 会与 LVGL 任务的渲染
-+    // 并发操作 LVGL 堆，导致死锁/堆损坏（表现为写入成功后整机卡死）。
-+    // 因此回调只置标志，在这里（LVGL 定时器上下文，已持锁）完成刷新。
-+    if (s_sync_pending) {
-+        s_sync_pending = false;
-+        s_last_sec = -1;   // 强制立即刷新显示
-+    }
-+
-     time_t now = time_manager_get_unix_utc();
-     time_manager_state_t st = time_manager_get_state();
-     time_t local = now + st.tz_offset;
-     struct tm tm;
-     localtime_r(&local, &tm);
- 
-+    // ---- BLE 功耗策略（v6，全部在 LVGL 上下文执行，跨任务安全）----
-+    // 1) 新同步事件（BLE / USB 写时间都会让 sync_count 自增）：
-+    //    安排 5 秒后自动关蓝牙，给对端留出收最终通知、回读状态的时间。
-+    if (st.sync_count != s_last_sync_count) {
-+        s_last_sync_count = st.sync_count;
-+        if (s_ble_started && s_ble_off_deadline_ms == 0) {
-+            s_ble_off_deadline_ms = esp_timer_get_time() / 1000 + BLE_AUTO_OFF_DELAY_MS;
-+            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动关闭 BLE 省电",
-+                     BLE_AUTO_OFF_DELAY_MS / 1000);
-+        }
-+    }
-+    // 2) 到点自动关：断开连接、停广播、释放 NimBLE（stop 为同步操作）。
-+    if (s_ble_off_deadline_ms > 0 &&
-+        (esp_timer_get_time() / 1000) >= s_ble_off_deadline_ms) {
-+        s_ble_off_deadline_ms = 0;
-+        if (s_ble_started) {
-+            ble_time_sync_stop();
-+            s_ble_started = false;
-+            ESP_LOGI(TAG, "同步完成，BLE 已自动关闭（OK 键可重新开启）");
-+        }
-+    }
-+    // 3) 状态栏 BT 指示
-+    bt_status_update();
-+
-     if (tm.tm_sec != s_last_sec) {
-         s_last_sec = tm.tm_sec;
-         update_time_display();
-@@ -437,8 +527,9 @@
- // ============================================================================
- static void on_ble_sync(void)
- {
-+    // 运行在 NimBLE host 任务中，禁止直接调用任何 LVGL API（见 tick() 内注释）。
-     ESP_LOGI(TAG, "BLE 时间同步完成");
--    update_time_display();
-+    s_sync_pending = true;
- }
- 
- // ============================================================================
-@@ -485,6 +576,7 @@
-         ble_time_sync_stop();
-         s_ble_started = false;
-     }
-+    s_ble_off_deadline_ms = 0;
-     if (s_scr) {
-         lv_obj_del(s_scr);
-         s_scr = NULL;
-@@ -497,6 +589,7 @@
-     s_uptime_label = NULL;
-     s_sync_icon = NULL;
-     s_sync_label = NULL;
-+    s_bt_label = NULL;
-     s_batt_icon_top = NULL;
-     s_batt_frame = NULL;
-     s_batt_fill = NULL;
-@@ -513,7 +606,7 @@
- // ============================================================================
- void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
- {
--    if (ev != BSP_BTN_EV_CLICK) return;
-+    if (ev != BSP_BTN_CLICK) return;
- 
-     switch (btn) {
-     case BSP_BTN_UP:
-@@ -542,17 +635,23 @@
-         break;
- 
-     case BSP_BTN_OK:
--        // 短按：重启 BLE 广播
-+        // 短按：手动开关 BLE（默认策略下同步后蓝牙已关，此键随时开启再同步）
-         if (s_ble_started) {
--            ble_time_sync_stop();
--            vTaskDelay(pdMS_TO_TICKS(200));
--        }
--        esp_err_t err = ble_time_sync_start();
--        if (err == ESP_OK) {
--            s_ble_started = true;
--            ble_time_sync_set_sync_callback(on_ble_sync);
--            ESP_LOGI(TAG, "BLE 已重启");
-+            ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
-+            s_ble_started = false;
-+            s_ble_off_deadline_ms = 0;
-+            ESP_LOGI(TAG, "BLE 已手动关闭");
-+        } else {
-+            esp_err_t err = ble_time_sync_start();
-+            if (err == ESP_OK) {
-+                s_ble_started = true;
-+                s_ble_off_deadline_ms = 0;
-+                ESP_LOGI(TAG, "BLE 已手动开启（等待连接/同步）");
-+            } else {
-+                ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));
-+            }
-         }
-+        bt_status_update();
-         break;
- 
-     default:
-
-===================================================================
-v7：重启后如实显示未同步（time_manager.c 与 cyber_clock.c 相对上游的最终累计 diff）
-===================================================================
---- orig-src/ai-passport/main/time_manager.c	2026-08-31 19:13:55.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/time_manager.c	2026-09-01 18:32:05.310474861 +0000
-@@ -62,6 +62,17 @@
-         nvs_close(h);
-     }
- 
-+    // 重启检测：本机没有 RTC 电池，断电/深度睡眠后 esp_timer 归零。
-+    // 若上次同步时刻"在未来"（last_sync_ms > 当前单调钟），说明发生了重启——
-+    // 当前时间只是 NVS 恢复的粗略旧值，不可信。如实清除 synced 标志并持久化，
-+    // 让 UI / BLE 通知 / USB Q 命令都显示未同步（v6 省电策略亦据此自动开广播等待对时）。
-+    if (s_state.synced &&
-+        s_state.last_sync_ms > esp_timer_get_time() / 1000) {
-+        s_state.synced = false;
-+        persist_state();
-+        ESP_LOGI(TAG, "检测到重启：恢复的时间不可信，synced 已清除（等待重新同步）");
-+    }
-+
-     s_initialized = true;
-     ESP_LOGI(TAG, "初始化完成: synced=%d tz=%ld sync_count=%u",
-              s_state.synced, (long)s_state.tz_offset, s_state.sync_count);
---- orig-src/ai-passport/main/cyber_clock.c	2026-09-01 05:17:31.000000000 +0000
-+++ /workspace/cyberpunk-clock-src/ai-passport/main/cyber_clock.c	2026-09-01 18:32:05.366954502 +0000
-@@ -12,8 +12,15 @@
- // 交互：
- //   UP   短按：切换配色主题
- //   DOWN 短按：切换显示模式（精简/完整）
--//   OK   短按：手动重启 BLE 广播
-+//   OK   短按：手动开关 BLE 广播
- //   OK   长按：返回菜单
-+//
-+// BLE 功耗策略（v6）：
-+//   - 进入时钟页时，仅当"时间不可信"（本次开机未同步过）才自动开启广播
-+//   - 同步成功（无论 BLE 还是 USB 写入）5 秒后自动关闭广播与连接（省电）；
-+//     延迟 5 秒是为了让对端收完最终状态通知、并留出回读时间
-+//   - OK 短按随时手动开/关，手动开启后不会被打断，直到下一次新的同步事件
-+//   - 顶部状态栏 BT 指示当前蓝牙状态（ADV=广播中 / LINK=已连接 / OFF=已关闭）
- #include "cyber_clock.h"
- #include "time_manager.h"
- #include "ble_time_sync.h"
-@@ -21,6 +28,8 @@
- #include "bsp_button.h"
  #include "esp_log.h"
- #include "esp_timer.h"
-+#include "freertos/FreeRTOS.h"
-+#include "freertos/task.h"
- #include "lvgl.h"
- #include <string.h>
- #include <stdio.h>
-@@ -119,6 +128,17 @@
- static int s_batt_mv = 0;
- static int64_t s_enter_time;
- static bool s_ble_started = false;
-+static volatile bool s_sync_pending;   // BLE 同步事件标志（跨任务传递）
-+static lv_obj_t *s_bt_label;           // 顶部蓝牙状态文字
-+static uint32_t s_last_sync_count;     // 上次看到的同步计数（新同步事件边沿检测）
-+static int64_t  s_ble_off_deadline_ms; // >0：到点自动关闭 BLE
-+static int      s_bt_disp_state = -1;  // 状态栏 BT 显示缓存（-1 强制刷新）
-+
-+// 同步成功后延迟关 BLE：给对端留出收最终 FFC2 通知 / 回读状态的时间
-+#define BLE_AUTO_OFF_DELAY_MS   5000
-+// "时间可信"判定窗口：本次开机内 1 小时内同步过即可信（重启后单调钟归零，
-+// last_sync_ms 反而变大 → elapsed 为负 → 不可信 → 自动开广播等待重新同步）
-+#define BLE_RELIABLE_WINDOW_S   3600
+ #include "esp_sleep.h"
++#include "time_manager.h"
++#include "usb_time_sync.h"
  
- // 星期名称
- static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-@@ -255,6 +275,12 @@
-     // 顶部电池图标（右移，因为去掉了百分比文字）
-     s_batt_icon_top = make_rect(s_scr, 210, 13, 14, 7, t->battery_ok);
-     make_rect(s_scr, 224, 15, 2, 3, t->battery_ok);
-+    // 蓝牙状态文字（电池图标左侧）
-+    s_bt_label = lv_label_create(s_scr);
-+    lv_obj_set_pos(s_bt_label, 150, 10);
-+    lv_label_set_text(s_bt_label, "BT OFF");
-+    lv_obj_set_style_text_font(s_bt_label, &lv_font_montserrat_14, 0);
-+    set_text_color(s_bt_label, t->text_dim);
+ static const char *TAG = "main";
  
-     // ---- 时间区域 (y=50-170) ----
-     // 大号 HH:MM 偏左
-@@ -339,6 +365,33 @@
+ static const demo_entry_t DEMOS[] = {
++    { "CyberClock", demo_cyber_clock_enter, demo_cyber_clock_exit, demo_cyber_clock_key },
+     { "Display", demo_display_enter, demo_display_exit, demo_display_key },
+     { "Button",  demo_button_enter,  demo_button_exit,  demo_button_key  },
+     { "Audio",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
+@@ -75,30 +78,14 @@
  }
  
- // ============================================================================
-+// 蓝牙状态栏指示：OFF / ADV / LINK（带缓存，状态不变不重绘）
-+// ============================================================================
-+static void bt_status_update(void)
-+{
-+    if (!s_bt_label) return;
-+    const cyber_theme_t *t = &THEMES[s_theme_idx];
-+    int st;
-+    const char *text;
-+    uint32_t color;
-+    if (!s_ble_started) {
-+        st = 0; text = "BT OFF"; color = t->text_dim;
-+    } else {
-+        ble_ts_state_t bs = ble_time_sync_get_state();
-+        if (bs == BLE_TS_CONNECTED || bs == BLE_TS_SYNCED) {
-+            st = 2; text = "BT LINK"; color = t->battery_ok;
-+        } else {
-+            st = 1; text = "BT ADV"; color = t->primary;
-+        }
-+    }
-+    if (st != s_bt_disp_state) {
-+        s_bt_disp_state = st;
-+        lv_label_set_text(s_bt_label, text);
-+        set_text_color(s_bt_label, color);
-+    }
-+}
-+
-+// ============================================================================
- // 主题应用
- // ============================================================================
- static void apply_theme(void)
-@@ -355,6 +408,8 @@
-     lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
-     lv_obj_set_style_bg_color(s_divider1, lv_color_hex(t->hud_line), 0);
-     lv_obj_set_style_bg_color(s_divider2, lv_color_hex(t->hud_line), 0);
-+    s_bt_disp_state = -1;   // 强制按新主题重绘 BT 状态
-+    bt_status_update();
-     battery_update();
- }
+ // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
++// v8 起开机直进 CyberClock 应用(同步页→表盘→菜单的页面状态机由 cyber_clock.c
++// 自管),所有按键直接转发,不再经过 demo 菜单。
+ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+     (void)user;
+     if (!bsp_lvgl_lock(500)) return;
  
-@@ -370,10 +425,17 @@
-     localtime_r(&local, &tm);
- 
-     // HH:MM
--    char buf[16];
-+    // 48 字节：容纳各格式理论最大值（含 "NOT SYNCED UTC%+d" 23 字节、
-+    // 日期最坏 35 字节），避免 -Werror=format-truncation 与实际截断。
-+    char buf[48];
-     snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
-     lv_label_set_text(s_time_label, buf);
- 
-+    // 未同步时时间主文字闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
-+    // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或蓝牙任一方式）。
-+    lv_obj_set_style_text_opa(s_time_label,
-+        (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
-+
-     // SS
-     snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
-     lv_label_set_text(s_sec_label, buf);
-@@ -416,12 +478,45 @@
- static void tick(lv_timer_t *timer)
- {
-     (void)timer;
-+    // BLE 同步回调运行在 NimBLE host 任务：LVGL 非线程安全且彼时未持
-+    // bsp_lvgl 锁，直接调 update_time_display() 会与 LVGL 任务的渲染
-+    // 并发操作 LVGL 堆，导致死锁/堆损坏（表现为写入成功后整机卡死）。
-+    // 因此回调只置标志，在这里（LVGL 定时器上下文，已持锁）完成刷新。
-+    if (s_sync_pending) {
-+        s_sync_pending = false;
-+        s_last_sec = -1;   // 强制立即刷新显示
-+    }
-+
-     time_t now = time_manager_get_unix_utc();
-     time_manager_state_t st = time_manager_get_state();
-     time_t local = now + st.tz_offset;
-     struct tm tm;
-     localtime_r(&local, &tm);
- 
-+    // ---- BLE 功耗策略（v6，全部在 LVGL 上下文执行，跨任务安全）----
-+    // 1) 新同步事件（BLE / USB 写时间都会让 sync_count 自增）：
-+    //    安排 5 秒后自动关蓝牙，给对端留出收最终通知、回读状态的时间。
-+    if (st.sync_count != s_last_sync_count) {
-+        s_last_sync_count = st.sync_count;
-+        if (s_ble_started && s_ble_off_deadline_ms == 0) {
-+            s_ble_off_deadline_ms = esp_timer_get_time() / 1000 + BLE_AUTO_OFF_DELAY_MS;
-+            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动关闭 BLE 省电",
-+                     BLE_AUTO_OFF_DELAY_MS / 1000);
-+        }
-+    }
-+    // 2) 到点自动关：断开连接、停广播、释放 NimBLE（stop 为同步操作）。
-+    if (s_ble_off_deadline_ms > 0 &&
-+        (esp_timer_get_time() / 1000) >= s_ble_off_deadline_ms) {
-+        s_ble_off_deadline_ms = 0;
-+        if (s_ble_started) {
-+            ble_time_sync_stop();
-+            s_ble_started = false;
-+            ESP_LOGI(TAG, "同步完成，BLE 已自动关闭（OK 键可重新开启）");
-+        }
-+    }
-+    // 3) 状态栏 BT 指示
-+    bt_status_update();
-+
-     if (tm.tm_sec != s_last_sec) {
-         s_last_sec = tm.tm_sec;
-         update_time_display();
-@@ -437,8 +532,9 @@
- // ============================================================================
- static void on_ble_sync(void)
- {
-+    // 运行在 NimBLE host 任务中，禁止直接调用任何 LVGL API（见 tick() 内注释）。
-     ESP_LOGI(TAG, "BLE 时间同步完成");
--    update_time_display();
-+    s_sync_pending = true;
- }
- 
- // ============================================================================
-@@ -485,6 +581,7 @@
-         ble_time_sync_stop();
-         s_ble_started = false;
-     }
-+    s_ble_off_deadline_ms = 0;
-     if (s_scr) {
-         lv_obj_del(s_scr);
-         s_scr = NULL;
-@@ -497,6 +594,7 @@
-     s_uptime_label = NULL;
-     s_sync_icon = NULL;
-     s_sync_label = NULL;
-+    s_bt_label = NULL;
-     s_batt_icon_top = NULL;
-     s_batt_frame = NULL;
-     s_batt_fill = NULL;
-@@ -513,7 +611,7 @@
- // ============================================================================
- void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
- {
--    if (ev != BSP_BTN_EV_CLICK) return;
-+    if (ev != BSP_BTN_CLICK) return;
- 
-     switch (btn) {
-     case BSP_BTN_UP:
-@@ -542,17 +640,23 @@
-         break;
- 
-     case BSP_BTN_OK:
--        // 短按：重启 BLE 广播
-+        // 短按：手动开关 BLE（默认策略下同步后蓝牙已关，此键随时开启再同步）
-         if (s_ble_started) {
--            ble_time_sync_stop();
--            vTaskDelay(pdMS_TO_TICKS(200));
+     if (s_active >= 0) {
+-        if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
+-            DEMOS[s_active].exit();
+-            enter_menu();
+-        } else {
+-            DEMOS[s_active].key(btn, ev);
 -        }
--        esp_err_t err = ble_time_sync_start();
--        if (err == ESP_OK) {
--            s_ble_started = true;
--            ble_time_sync_set_sync_callback(on_ble_sync);
--            ESP_LOGI(TAG, "BLE 已重启");
-+            ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
-+            s_ble_started = false;
-+            s_ble_off_deadline_ms = 0;
-+            ESP_LOGI(TAG, "BLE 已手动关闭");
-+        } else {
-+            esp_err_t err = ble_time_sync_start();
-+            if (err == ESP_OK) {
-+                s_ble_started = true;
-+                s_ble_off_deadline_ms = 0;
-+                ESP_LOGI(TAG, "BLE 已手动开启（等待连接/同步）");
-+            } else {
-+                ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));
-+            }
-         }
-+        bt_status_update();
-         break;
+-    } else if (ev == BSP_BTN_CLICK) {
+-        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
+-        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
+-        if (btn == BSP_BTN_OK && s_ok[s_sel]) {
+-            s_active = s_sel;
+-            ui_pixel_mascot_jump(s_mascot);
+-            lv_obj_delete(s_menu_scr);
+-            s_menu_scr = NULL;
+-            s_mascot = NULL;
+-            DEMOS[s_active].enter();
+-        } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
+-            ui_pixel_mascot_jump(s_mascot);
+-        }
++        DEMOS[s_active].key(btn, ev);   // 长按返回等导航由应用内部处理
+     }
+     bsp_lvgl_unlock();
+ }
+@@ -113,6 +100,10 @@
+     bsp_i2c_init();
+     bsp_i2c_scan();
  
-     default:
-
-===================================================================
-v8：四页面动线重构（main.c 与 cyber_clock.c 相对 v7 的 diff；cyber_clock.c 为整体重写）
-===================================================================
-diff --git a/main/cyber_clock.c b/main/cyber_clock.c
-index 48bcc04..570a898 100644
---- a/main/cyber_clock.c
++    // 时间管理 + USB 串口对时(常驻,任意页面可用,不依赖蓝牙)
++    time_manager_init();
++    usb_time_sync_start();
++
+     // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
+     // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
+     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
+@@ -124,16 +115,21 @@
+     bsp_display_backlight(100);
+ 
+     // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
+-    s_ok[0] = true;                                   // Display 已确认可用
+-    s_ok[1] = (bsp_button_init(on_key, NULL) == ESP_OK);
+-    s_ok[2] = (bsp_audio_init() == ESP_OK);
+-    s_ok[3] = (bsp_battery_init() == ESP_OK);
+-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
+-    s_ok[5] = true;
++    s_ok[0] = true;                                   // CyberClock（时间+BLE，页面内自处理）
++    s_ok[1] = true;                                   // Display 已确认可用
++    s_ok[2] = (bsp_button_init(on_key, NULL) == ESP_OK);
++    s_ok[3] = (bsp_audio_init() == ESP_OK);
++    s_ok[4] = (bsp_battery_init() == ESP_OK);
++    s_ok[5] = true;                                    // 页面内按需初始化并显示错误
+     s_ok[6] = true;
++    s_ok[7] = true;
+ 
+-    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
++    // v8：开机直进 CyberClock 应用首屏（时间同步页）。设备无 RTC 电池，
++    // 开机时间必然不可信，先进同步页对时是自洽的动线（USB/蓝牙任一同步后
++    // 自动进入表盘）。上游 demo 菜单代码保留但不再作为入口。
++    s_active = 0;
++    if (bsp_lvgl_lock(1000)) { DEMOS[0].enter(); bsp_lvgl_unlock(); }
+ 
+-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
+-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
++    ESP_LOGI(TAG, "就绪:Clock=%d Display=%d Button=%d Audio=%d Battery=%d",
++             s_ok[0], s_ok[1], s_ok[2], s_ok[3], s_ok[4]);
+ }
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -10,6 +10,10 @@
+          "demo_wifi.c"
+          "demo_ble.c"
+          "demo_low_power.c"
++         "time_manager.c"
++         "ble_time_sync.c"
++         "usb_time_sync.c"
++         "cyber_clock.c"
+     INCLUDE_DIRS "."
+-    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
++    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash esp_driver_usb_serial_jtag
+ )
+--- /dev/null
 +++ b/main/cyber_clock.c
-@@ -1,33 +1,31 @@
--// main/cyber_clock.c —— 赛博朋克风格时钟 + BLE 时间同步（v3 方案C布局）
-+// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v8 动线重构）
- //
--// v3 方案C布局（240x320 竖屏）：
--//   - 顶部状态栏：蓝牙图标 + 同步状态 + 电池图标
--//   - 中上部：大号 HH:MM 偏左，右侧小号 SS 秒数 + 垂直发光进度柱
--//   - 中部：日期 + 星期
--//   - 中下部：同步状态文字 + 时区
--//   - 底部：电池电量条 + 百分比 + 电压
--//   - 装饰：四角 L 形角标、侧边刻度线、简洁电路线条
--//   - 去掉所有无意义参数文字，只保留有意义的信息
-+// v8 页面动线（240x320 竖屏，三个实体按键）：
-+//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启，USB/蓝牙任一同步成功
-+//          后 5 秒自动进入表盘；OK 可立即跳过）
+@@ -0,0 +1,1450 @@
++// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v10 B1++ 表盘重制）
++//
++// v8/v9 页面动线（240x320 竖屏，三个实体按键）：
++//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启；同步成功后停留本页，
++//          按 OK 手动进表盘）
 +//   PAGE_CLOCK（表盘页：纯显示，无蓝牙。UP=主题 DOWN=模式 OK长按=菜单）
 +//   PAGE_MENU（菜单页：1 表盘 / 2 亮度 / 3 时间同步。UP/DOWN 选择，OK 进入，
 +//          OK 长按回表盘）
 +//   PAGE_BRIGHT（亮度页：UP/DOWN 以 10% 步进调整 10..100，NVS 持久化，
 +//          OK/长按返回菜单）
- //
--// 交互：
--//   UP   短按：切换配色主题
--//   DOWN 短按：切换显示模式（精简/完整）
--//   OK   短按：手动开关 BLE 广播
--//   OK   长按：返回菜单
--//
--// BLE 功耗策略（v6）：
--//   - 进入时钟页时，仅当"时间不可信"（本次开机未同步过）才自动开启广播
--//   - 同步成功（无论 BLE 还是 USB 写入）5 秒后自动关闭广播与连接（省电）；
--//     延迟 5 秒是为了让对端收完最终状态通知、并留出回读时间
--//   - OK 短按随时手动开/关，手动开启后不会被打断，直到下一次新的同步事件
--//   - 顶部状态栏 BT 指示当前蓝牙状态（ADV=广播中 / LINK=已连接 / OFF=已关闭）
++//
++// v10 表盘页按 B1++ 定稿重制（统一 20px 内容边距、右缘对齐、准星几何居中）：
++//   - 版式：内嵌外框 + 上下刻度尺（中轴 120 长格）+ 四角双线角标
++//           顶栏（型号 / 十六进制流 / 电量%）/ 双色差残影大时间 + 强调线
++//           秒数 + 垂直秒进度柱 / 日期星期行 / 12 根频谱条
++//           终端行（> UTC+8_ 光标闪烁 | 像素心形 + 运行时长）
++//           分段电池（10 段）+ 底部十六进制流
++//   - 5 主题：0 霓虹青紫 / 1 传统墨水屏（纸白墨黑，静态：无残影、无故障特效）
++//             2 青绿 / 3 橙红 / 4 矩阵绿
++//   - 动效（100ms tick 状态机，全部确定性伪随机，零额外资源）：
++//     · 故障爆发：约 7s 一次（秒数 %7==3），300ms 内色差残影分离加剧、
++//       主字微移轻闪、时间区 1-2 条错位切片条（墨水屏与精简模式禁用）
++//     · 故障色条：每 3s 换位（墨水屏与精简模式禁用）
++//     · 心跳：像素心形按秒 lub-dub 双跳（放大/复位/弱跳/复位）
++//     · 频谱随秒数起伏、光标按秒闪烁、未同步时时间主字呼吸闪烁（v7 保留）
++//
 +// 设计要点：
-+//   - 表盘页彻底不再管蓝牙（v6 的"表盘内自动开关广播"策略整体迁移到同步页：
-+//     进同步页必开广播，离开同步页即停，同步成功后 5 秒自动跳表盘顺带关 BLE）
-+//   - USB 串口对时是常驻服务，任何页面都可完成同步；非同步页收到同步事件
-+//     只是时间刷新，不发生页面跳转
++//   - 表盘页彻底不管蓝牙（进同步页必开广播，离开即停）
++//   - USB 串口对时是常驻服务，任何页面都可完成同步
 +//   - LVGL 线程安全：BLE 回调只置 s_sync_pending 标志，所有 UI 更新都在
 +//     LVGL 定时器上下文（已持 bsp_lvgl 锁）完成
 +//   - 字体为 montserrat（无中文字形），界面文案一律英文
- #include "cyber_clock.h"
- #include "time_manager.h"
- #include "ble_time_sync.h"
- #include "bsp_battery.h"
- #include "bsp_button.h"
++#include "cyber_clock.h"
++#include "time_manager.h"
++#include "ble_time_sync.h"
++#include "bsp_battery.h"
++#include "bsp_button.h"
 +#include "bsp_display.h"
- #include "esp_log.h"
- #include "esp_timer.h"
++#include "esp_log.h"
++#include "esp_timer.h"
 +#include "nvs.h"
- #include "freertos/FreeRTOS.h"
- #include "freertos/task.h"
- #include "lvgl.h"
-@@ -50,7 +48,7 @@ typedef struct {
- } cyber_theme_t;
- 
- static const cyber_theme_t THEMES[] = {
--    { // 0: 蓝紫双色霓虹（方案C 默认）
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "lvgl.h"
++#include <string.h>
++#include <stdio.h>
++#include <math.h>
++
++static const char *TAG = "cyber_clk";
++
++// LVGL 透明度预置档只有 10 的整数倍：残影 2 的 0.15 档自定义（38/255）
++#define GHOST2_OPA ((lv_opa_t)38)
++
++// ============================================================================
++// 配色主题
++// ============================================================================
++typedef struct {
++    uint32_t bg;
++    uint32_t primary;     // 主色（时间数字、主装饰）
++    uint32_t secondary;   // 次色（秒数、强调装饰）
++    uint32_t text_dim;    // 暗色文字（日期、状态）
++    uint32_t warn;        // 警告色（未同步/低电量）
++    uint32_t battery_ok;  // 电池正常色
++    uint32_t hud_line;    // HUD 装饰线
++} cyber_theme_t;
++
++static const cyber_theme_t THEMES[] = {
 +    { // 0: 蓝紫双色霓虹（默认）
-         .bg = 0x0A0A1A,
-         .primary = 0x00FFFF,
-         .secondary = 0xFF00FF,
-@@ -90,7 +88,7 @@ static const cyber_theme_t THEMES[] = {
- #define THEME_COUNT (sizeof(THEMES) / sizeof(THEMES[0]))
- 
- // ============================================================================
--// 显示模式
++        .bg = 0x0A0A1A,
++        .primary = 0x00FFFF,
++        .secondary = 0xFF00FF,
++        .text_dim = 0x6688AA,
++        .warn = 0xFF3333,
++        .battery_ok = 0x00FF88,
++        .hud_line = 0x004466,
++    },
++    { // 1: 传统墨水屏黑白（第二屏：纸白底 + 墨黑字，纯静态——
++       //    隐藏色差残影与故障元素，无任何故障特效）
++        .bg = 0xEDEBE2,
++        .primary = 0x17171C,
++        .secondary = 0x4A4A52,
++        .text_dim = 0x8A887C,
++        .warn = 0x3A3A3A,
++        .battery_ok = 0x2E2E2E,
++        .hud_line = 0xB9B6AA,
++    },
++    { // 2: 青绿单色
++        .bg = 0x040808,
++        .primary = 0x00FFCC,
++        .secondary = 0x00AA88,
++        .text_dim = 0x448877,
++        .warn = 0xFF6644,
++        .battery_ok = 0x44FFAA,
++        .hud_line = 0x003322,
++    },
++    { // 3: 橙红暖色
++        .bg = 0x120804,
++        .primary = 0xFF8800,
++        .secondary = 0xFF2244,
++        .text_dim = 0xAA6644,
++        .warn = 0xFFFF00,
++        .battery_ok = 0xFFAA00,
++        .hud_line = 0x442200,
++    },
++    { // 4: 矩阵绿
++        .bg = 0x040804,
++        .primary = 0x00FF44,
++        .secondary = 0x88FF00,
++        .text_dim = 0x448844,
++        .warn = 0xFF4400,
++        .battery_ok = 0x00FF44,
++        .hud_line = 0x003311,
++    },
++};
++#define THEME_COUNT (sizeof(THEMES) / sizeof(THEMES[0]))
++#define THEME_EINK  1   // 墨水屏主题索引：静态专属处理都以此判断
++
++// ============================================================================
 +// 显示模式（表盘页）
- // ============================================================================
- typedef enum {
-     MODE_FULL = 0,    // 完整信息
-@@ -98,10 +96,41 @@ typedef enum {
-     MODE_COUNT,
- } display_mode_t;
- 
++// ============================================================================
++typedef enum {
++    MODE_FULL = 0,    // 完整信息
++    MODE_MINIMAL,     // 精简（只显示时间+日期+电池）
++    MODE_COUNT,
++} display_mode_t;
++
 +// ============================================================================
 +// 页面状态机
 +// ============================================================================
@@ -951,9 +1068,6 @@ index 48bcc04..570a898 100644
 +
 +#define MENU_ITEM_COUNT 3
 +
-+// 同步成功后自动进表盘的延迟：给对端留出收最终 FFC2 通知 / 回读状态的时间
-+#define SYNC_AUTO_EXIT_MS   5000
-+
 +// 亮度范围与步进
 +#define BRIGHT_MIN   10
 +#define BRIGHT_MAX   100
@@ -966,29 +1080,56 @@ index 48bcc04..570a898 100644
 +// 星期名称
 +static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
 +
- // ============================================================================
- // 全局状态
- // ============================================================================
- static lv_obj_t *s_scr;
++// ============================================================================
++// 全局状态
++// ============================================================================
++static lv_obj_t *s_scr;
 +static lv_obj_t *s_pg[PAGE_COUNT_];       // 四个页面容器（互斥显示）
 +
-+// ---- 表盘页控件 ----
- static lv_obj_t *s_time_label;       // HH:MM 大号
- static lv_obj_t *s_sec_label;        // SS 小号
- static lv_obj_t *s_date_label;       // 日期
-@@ -109,7 +138,7 @@ static lv_obj_t *s_weekday_label;    // 星期
- static lv_obj_t *s_status_label;     // 同步状态+时区
- static lv_obj_t *s_uptime_label;     // 运行时间
- static lv_obj_t *s_sync_icon;        // 同步状态图标
--static lv_obj_t *s_sync_label;       // 同步文字
-+static lv_obj_t *s_sync_label;       // 顶部 SYNC 文字
- static lv_obj_t *s_batt_icon_top;    // 顶部电池图标
- static lv_obj_t *s_batt_frame;       // 底部电池外框
- static lv_obj_t *s_batt_fill;        // 底部电池填充
-@@ -120,7 +149,39 @@ static lv_obj_t *s_corners[4];       // 四角装饰
- static lv_obj_t *s_divider1;         // 分割线1
- static lv_obj_t *s_divider2;         // 分割线2
- 
++// ---- 表盘页控件（v10 B1++ 版式）----
++static lv_obj_t *s_frame;                  // 内嵌外框（3px 内缩 1px 描边）
++static lv_obj_t *s_ruler_top;              // 顶部刻度尺横条
++static lv_obj_t *s_ruler_bot;              // 底部刻度尺横条
++static lv_obj_t *s_ticks_top[13];          // 顶部刻度（中轴 x=120 长格用主色）
++static lv_obj_t *s_ticks_bot[13];          // 底部刻度
++static lv_obj_t *s_corner[8];              // 四角双线角标
++static lv_obj_t *s_hdr_model;              // 顶栏左：CC-320
++static lv_obj_t *s_hdr_hex;                // 顶栏中：十六进制流 0x????
++static lv_obj_t *s_hdr_batt;               // 顶栏右：电量 %
++static lv_obj_t *s_time_ghost1;            // 时间色差残影 1（左偏，暗）
++static lv_obj_t *s_time_ghost2;            // 时间色差残影 2（右偏，更暗）
++static lv_obj_t *s_time_label;             // HH:MM 主字 48px
++static lv_obj_t *s_under1;                 // 强调线主段（124x2）
++static lv_obj_t *s_under2;                 // 强调线次段（84x1）
++static lv_obj_t *s_sec_label;              // SS 24px
++static lv_obj_t *s_secbar_frame;           // 秒进度柱外框
++static lv_obj_t *s_secbar_fill;            // 秒进度柱填充
++static lv_obj_t *s_div1_l, *s_div1_r;      // 分割线 1 左右段（带准星缺口）
++static lv_obj_t *s_div1_n;                 // 分割线 1 准星缺口
++static lv_obj_t *s_div2_l, *s_div2_r;      // 分割线 2 左右段
++static lv_obj_t *s_div2_n;                 // 分割线 2 准星缺口
++static lv_obj_t *s_div3;                   // 分割线 3（通栏）
++static lv_obj_t *s_date_label;             // 日期
++static lv_obj_t *s_weekday_label;          // 星期（右缘对齐）
++static lv_obj_t *s_spec[12];               // 频谱条 12 根
++static lv_obj_t *s_term_label;             // 终端行：> UTC+8_
++static lv_obj_t *s_heart_sm[7];            // 像素心形（常规 9x7）
++static lv_obj_t *s_heart_bg[7];            // 像素心形（放大 12x10，心跳用）
++static lv_obj_t *s_uptime_label;           // 运行时长（心形右侧，右缘对齐）
++static lv_obj_t *s_gbar[3];                // 故障色条 3 根（每 3s 换位）
++static lv_obj_t *s_slice[2];               // 故障切片条（爆发时显示）
++static lv_obj_t *s_batt_frame;             // 电池外框（2px 描边）
++static lv_obj_t *s_batt_cap;               // 电池正极凸块
++static lv_obj_t *s_batt_seg[10];           // 电池 10 分段
++static lv_obj_t *s_batt_pct;               // 电池百分比
++static lv_obj_t *s_batt_volt;              // 电池电压（右缘对齐）
++static lv_obj_t *s_stream2;                // 底部十六进制流 >> 0x??????
++
++// ---- 表盘动效状态（100ms tick 驱动）----
++static int s_glitch_ticks = 0;             // 故障爆发剩余 tick 数（0=常态）
++static int s_beat_phase = 4;               // 心跳相位（0..3 活跃，>=4 静止）
++static uint32_t s_rnd = 1;                 // 确定性伪随机（种子=触发秒）
++
 +// ---- 同步页控件 ----
 +static lv_obj_t *s_sp_title;         // 标题 TIME SYNC
 +static lv_obj_t *s_sp_time;          // HH:MM
@@ -1018,41 +1159,150 @@ index 48bcc04..570a898 100644
 +static lv_obj_t *s_bp_hint2;
 +static lv_obj_t *s_bp_div;
 +
- static lv_timer_t *s_timer;
++static lv_timer_t *s_timer;
 +static app_page_t s_page = PAGE_COUNT_;   // 当前页面（初始哨兵值）
 +static int s_menu_sel = 0;                // 菜单选中项
 +static uint8_t s_brightness = BRIGHT_MAX; // 当前亮度（10..100）
- static int s_theme_idx = 0;
- static display_mode_t s_mode = MODE_FULL;
- static int s_last_sec = -1;
-@@ -128,20 +189,9 @@ static int s_batt_soc = -1;
- static int s_batt_mv = 0;
- static int64_t s_enter_time;
- static bool s_ble_started = false;
--static volatile bool s_sync_pending;   // BLE 同步事件标志（跨任务传递）
--static lv_obj_t *s_bt_label;           // 顶部蓝牙状态文字
--static uint32_t s_last_sync_count;     // 上次看到的同步计数（新同步事件边沿检测）
--static int64_t  s_ble_off_deadline_ms; // >0：到点自动关闭 BLE
--static int      s_bt_disp_state = -1;  // 状态栏 BT 显示缓存（-1 强制刷新）
--
--// 同步成功后延迟关 BLE：给对端留出收最终 FFC2 通知 / 回读状态的时间
--#define BLE_AUTO_OFF_DELAY_MS   5000
--// "时间可信"判定窗口：本次开机内 1 小时内同步过即可信（重启后单调钟归零，
--// last_sync_ms 反而变大 → elapsed 为负 → 不可信 → 自动开广播等待重新同步）
--#define BLE_RELIABLE_WINDOW_S   3600
--
--// 星期名称
--static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
++static int s_theme_idx = 0;
++static display_mode_t s_mode = MODE_FULL;
++static int s_last_sec = -1;
++static int s_batt_soc = -1;
++static int s_batt_mv = 0;
++static int64_t s_enter_time;
++static bool s_ble_started = false;
 +static volatile bool s_sync_pending;      // BLE 同步事件标志（跨任务传递）
-+static uint32_t s_last_sync_count;        // 上次看到的同步计数（新同步事件边沿检测）
-+static int64_t  s_auto_exit_ms = 0;       // >0：到点自动离开同步页进表盘
- 
- // ============================================================================
- // 工具函数
-@@ -164,8 +214,54 @@ static void set_text_color(lv_obj_t *label, uint32_t color)
-     lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
- }
- 
++
++// ============================================================================
++// 工具函数
++// ============================================================================
++static lv_obj_t *make_rect(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color)
++{
++    lv_obj_t *o = lv_obj_create(parent);
++    lv_obj_set_pos(o, x, y);
++    lv_obj_set_size(o, w, h);
++    lv_obj_set_style_bg_color(o, lv_color_hex(color), 0);
++    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_width(o, 0, 0);
++    lv_obj_set_style_radius(o, 0, 0);
++    lv_obj_set_style_pad_all(o, 0, 0);
++    return o;
++}
++
++static void set_text_color(lv_obj_t *label, uint32_t color)
++{
++    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
++}
++
++// 文字标签快捷创建（指定字体与颜色）
++static lv_obj_t *make_label(lv_obj_t *parent, int x, int y,
++                            const lv_font_t *font, uint32_t color)
++{
++    lv_obj_t *l = lv_label_create(parent);
++    lv_obj_set_pos(l, x, y);
++    lv_obj_set_style_text_font(l, font, 0);
++    lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
++    return l;
++}
++
++// 右缘对齐标签：给定右边界 x2，标签占 [x, x2] 并右对齐文本
++static void label_right_align(lv_obj_t *l, int x, int x2)
++{
++    lv_obj_set_pos(l, x, lv_obj_get_y(l));
++    lv_obj_set_width(l, x2 - x);
++    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
++}
++
++// 确定性伪随机（LCG）：种子由触发时刻的秒数决定，同秒重现同图案
++static uint32_t rnd_next(void)
++{
++    s_rnd = s_rnd * 1664525u + 1013904223u;
++    return s_rnd >> 8;
++}
++
++static void rnd_seed(uint32_t seed)
++{
++    s_rnd = (seed * 2654435761u) | 1u;
++}
++
++// 墨水屏主题：纯静态（无残影/无故障特效），灰阶元素透明度降低模拟网点
++static inline bool theme_is_eink(void)
++{
++    return s_theme_idx == THEME_EINK;
++}
++
++// 显示模式辅助：精简模式隐藏装饰流（顶栏十六进制/频谱/底流/故障色条）
++static inline bool mode_is_full(void)
++{
++    return s_mode == MODE_FULL;
++}
++
++// ============================================================================
++// 心跳（像素心形两组互换：常规 9x7 / 放大 12x10）
++// ============================================================================
++static void heart_set(bool big)
++{
++    for (int i = 0; i < 7; i++) {
++        if (big) {
++            lv_obj_add_flag(s_heart_sm[i], LV_OBJ_FLAG_HIDDEN);
++            lv_obj_clear_flag(s_heart_bg[i], LV_OBJ_FLAG_HIDDEN);
++        } else {
++            lv_obj_clear_flag(s_heart_sm[i], LV_OBJ_FLAG_HIDDEN);
++            lv_obj_add_flag(s_heart_bg[i], LV_OBJ_FLAG_HIDDEN);
++        }
++    }
++}
++
++// ============================================================================
++// 故障爆发（收敛版：±5px 色差分离 + 主字 ±1px 轻闪 + 1-2 条错位切片）
++// ============================================================================
++static void glitch_apply(int sec)
++{
++    rnd_seed((uint32_t)sec);
++    lv_obj_set_x(s_time_ghost1, 16 - 5);
++    lv_obj_set_x(s_time_ghost2, 26 + 5);
++    lv_obj_set_style_text_opa(s_time_ghost1, LV_OPA_40, 0);
++    lv_obj_set_style_text_opa(s_time_ghost2, LV_OPA_30, 0);
++    lv_obj_set_x(s_time_label, 20 + (rnd_next() & 1 ? 1 : -1));
++    lv_obj_set_style_text_opa(s_time_label, LV_OPA_70, 0);
++    // 切片条：1-2 条（第二条按秒奇偶出现），宽 30-89，落在时间区 y55-124
++    for (int k = 0; k < 2; k++) {
++        bool show = (k == 0) || (sec & 1);
++        if (!show) {
++            lv_obj_add_flag(s_slice[k], LV_OBJ_FLAG_HIDDEN);
++            continue;
++        }
++        int w = 30 + (int)(rnd_next() % 60);
++        int x = (int)(rnd_next() % (uint32_t)(220 - w));
++        int y = 55 + (int)(rnd_next() % 70);
++        lv_obj_set_pos(s_slice[k], x, y);
++        lv_obj_set_size(s_slice[k], w, 2);
++        lv_obj_clear_flag(s_slice[k], LV_OBJ_FLAG_HIDDEN);
++    }
++}
++
++static void glitch_restore(void)
++{
++    lv_obj_set_x(s_time_ghost1, 16);
++    lv_obj_set_x(s_time_ghost2, 26);
++    lv_obj_set_style_text_opa(s_time_ghost1, LV_OPA_30, 0);
++    lv_obj_set_style_text_opa(s_time_ghost2, GHOST2_OPA, 0);
++    lv_obj_set_x(s_time_label, 20);
++    lv_obj_set_style_text_opa(s_time_label, LV_OPA_COVER, 0);
++    lv_obj_add_flag(s_slice[0], LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(s_slice[1], LV_OBJ_FLAG_HIDDEN);
++}
++
++// 故障色条换位（每 3s）：x 随机 0-169，y 在 {50,128,176} 三档
++static void gbar_shuffle(int sec)
++{
++    rnd_seed((uint32_t)sec);
++    static const int ys[3] = { 50, 128, 176 };
++    for (int i = 0; i < 3; i++) {
++        lv_obj_set_x(s_gbar[i], (int)(rnd_next() % 170));
++        lv_obj_set_y(s_gbar[i], ys[rnd_next() % 3]);
++    }
++}
++
 +// 满屏透明页面容器（不滚动、无边框、无内边距）
 +static lv_obj_t *make_page_container(void)
 +{
@@ -1068,8 +1318,7 @@ index 48bcc04..570a898 100644
 +    return p;
 +}
 +
- // ============================================================================
--// 电池组件
++// ============================================================================
 +// 亮度：加载 / 保存 / 应用
 +// ============================================================================
 +static void brightness_load(void)
@@ -1102,198 +1351,251 @@ index 48bcc04..570a898 100644
 +
 +// ============================================================================
 +// 电池组件（表盘页）
- // ============================================================================
- static void battery_update(void)
- {
-@@ -227,38 +323,32 @@ static void battery_refresh(void)
- }
- 
- // ============================================================================
--// UI 构建
++// ============================================================================
++static void battery_update(void)
++{
++    if (s_batt_soc < 0) {
++        // 首次读取
++        int soc = bsp_battery_soc();
++        int mv = bsp_battery_mv();
++        if (soc >= 0) {
++            s_batt_soc = soc;
++            s_batt_mv = (mv >= 0) ? mv : 3700;
++        } else {
++            s_batt_soc = 50;  // 默认值
++            s_batt_mv = 3700;
++        }
++    }
++
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++    int soc = s_batt_soc;
++    if (soc < 0) soc = 0;
++    if (soc > 100) soc = 100;
++
++    // 分段电池：10 段，lit = ceil(soc/10)（87% → 9 段点亮）
++    uint32_t batt_color = (soc < 20) ? t->warn : t->battery_ok;
++    int lit = (soc + 9) / 10;
++    lv_opa_t lit_opa = theme_is_eink() ? LV_OPA_50 : LV_OPA_90;
++    for (int i = 0; i < 10; i++) {
++        lv_obj_set_style_bg_color(s_batt_seg[i], lv_color_hex(batt_color), 0);
++        lv_obj_set_style_bg_opa(s_batt_seg[i],
++            (i < lit) ? lit_opa : LV_OPA_20, 0);
++    }
++    lv_obj_set_style_border_color(s_batt_frame, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
++
++    // 电池行百分比文字
++    char buf[16];
++    snprintf(buf, sizeof(buf), "%d%%", soc);
++    lv_label_set_text(s_batt_pct, buf);
++    set_text_color(s_batt_pct, batt_color);
++
++    // 顶栏右缘电量%
++    lv_label_set_text(s_hdr_batt, buf);
++
++    // 电压文字（右缘对齐）
++    snprintf(buf, sizeof(buf), "%d.%02dV", s_batt_mv / 1000, (s_batt_mv % 1000) / 10);
++    lv_label_set_text(s_batt_volt, buf);
++    set_text_color(s_batt_volt, t->text_dim);
++}
++
++// 每 5 秒刷新一次电池读数（避免频繁 I2C 阻塞）
++static void battery_refresh(void)
++{
++    int soc = bsp_battery_soc();
++    int mv = bsp_battery_mv();
++    if (soc >= 0) {
++        s_batt_soc = soc;
++        s_batt_mv = (mv >= 0) ? mv : s_batt_mv;
++    }
++    battery_update();
++}
++
++// ============================================================================
 +// 表盘页 UI
- // ============================================================================
--static void build_ui(void)
++// ============================================================================
 +static void build_clock_page(void)
- {
++{
 +    lv_obj_t *parent = s_pg[PAGE_CLOCK];
-     const cyber_theme_t *t = &THEMES[s_theme_idx];
- 
--    s_scr = lv_obj_create(NULL);
--    lv_obj_set_style_bg_color(s_scr, lv_color_hex(t->bg), 0);
--    lv_obj_set_style_bg_opa(s_scr, LV_OPA_COVER, 0);
--    lv_obj_set_style_border_width(s_scr, 0, 0);
--    lv_obj_set_style_pad_all(s_scr, 0, 0);
--
-     // ---- 四角 L 形装饰角标 ----
-     int corner_size = 12;
-     int corner_w = 2;
-     // 左上
--    s_corners[0] = make_rect(s_scr, 6, 6, corner_size, corner_w, t->hud_line);
--    make_rect(s_scr, 6, 6, corner_w, corner_size, t->hud_line);
-+    s_corners[0] = make_rect(parent, 6, 6, corner_size, corner_w, t->hud_line);
-+    make_rect(parent, 6, 6, corner_w, corner_size, t->hud_line);
-     // 右上
--    s_corners[1] = make_rect(s_scr, 240-6-corner_size, 6, corner_size, corner_w, t->hud_line);
--    make_rect(s_scr, 240-6-corner_w, 6, corner_w, corner_size, t->hud_line);
-+    s_corners[1] = make_rect(parent, 240-6-corner_size, 6, corner_size, corner_w, t->hud_line);
-+    make_rect(parent, 240-6-corner_w, 6, corner_w, corner_size, t->hud_line);
-     // 左下
--    s_corners[2] = make_rect(s_scr, 6, 320-6-corner_w, corner_size, corner_w, t->hud_line);
--    make_rect(s_scr, 6, 320-6-corner_size, corner_w, corner_size, t->hud_line);
-+    s_corners[2] = make_rect(parent, 6, 320-6-corner_w, corner_size, corner_w, t->hud_line);
-+    make_rect(parent, 6, 320-6-corner_size, corner_w, corner_size, t->hud_line);
-     // 右下
--    s_corners[3] = make_rect(s_scr, 240-6-corner_size, 320-6-corner_w, corner_size, corner_w, t->hud_line);
--    make_rect(s_scr, 240-6-corner_w, 320-6-corner_size, corner_w, corner_size, t->hud_line);
-+    s_corners[3] = make_rect(parent, 240-6-corner_size, 320-6-corner_w, corner_size, corner_w, t->hud_line);
-+    make_rect(parent, 240-6-corner_w, 320-6-corner_size, corner_w, corner_size, t->hud_line);
- 
-     // ---- 顶部状态栏 (y=8-28) ----
--    // 蓝牙文字标识
--    // 同步状态图标（圆形，左移因为去掉了BT）
--    s_sync_icon = lv_obj_create(s_scr);
-+    // 同步状态图标
-+    s_sync_icon = lv_obj_create(parent);
-     lv_obj_set_pos(s_sync_icon, 20, 12);
-     lv_obj_set_size(s_sync_icon, 10, 10);
-     lv_obj_set_style_bg_color(s_sync_icon, lv_color_hex(t->warn), 0);
-@@ -267,137 +357,354 @@ static void build_ui(void)
-     lv_obj_set_style_radius(s_sync_icon, LV_RADIUS_CIRCLE, 0);
-     lv_obj_set_style_pad_all(s_sync_icon, 0, 0);
-     // 同步文字
--    s_sync_label = lv_label_create(s_scr);
-+    s_sync_label = lv_label_create(parent);
-     lv_obj_set_pos(s_sync_label, 36, 10);
-     lv_label_set_text(s_sync_label, "SYNC");
-     lv_obj_set_style_text_font(s_sync_label, &lv_font_montserrat_14, 0);
-     set_text_color(s_sync_label, t->text_dim);
--    // 顶部电池图标（右移，因为去掉了百分比文字）
--    s_batt_icon_top = make_rect(s_scr, 210, 13, 14, 7, t->battery_ok);
--    make_rect(s_scr, 224, 15, 2, 3, t->battery_ok);
--    // 蓝牙状态文字（电池图标左侧）
--    s_bt_label = lv_label_create(s_scr);
--    lv_obj_set_pos(s_bt_label, 150, 10);
--    lv_label_set_text(s_bt_label, "BT OFF");
--    lv_obj_set_style_text_font(s_bt_label, &lv_font_montserrat_14, 0);
--    set_text_color(s_bt_label, t->text_dim);
-+    // 顶部电池图标
-+    s_batt_icon_top = make_rect(parent, 210, 13, 14, 7, t->battery_ok);
-+    make_rect(parent, 224, 15, 2, 3, t->battery_ok);
- 
-     // ---- 时间区域 (y=50-170) ----
--    // 大号 HH:MM 偏左
--    s_time_label = lv_label_create(s_scr);
-+    s_time_label = lv_label_create(parent);
-     lv_obj_set_pos(s_time_label, 16, 60);
-     lv_label_set_text(s_time_label, "00:00");
-     lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
-     set_text_color(s_time_label, t->primary);
- 
--    // 右侧秒数 SS（去掉垂直进度柱后右移）
--    s_sec_label = lv_label_create(s_scr);
-+    // 右侧秒数 SS
-+    s_sec_label = lv_label_create(parent);
-     lv_obj_set_pos(s_sec_label, 180, 72);
-     lv_label_set_text(s_sec_label, "00");
-     lv_obj_set_style_text_font(s_sec_label, &lv_font_montserrat_24, 0);
-     set_text_color(s_sec_label, t->secondary);
- 
--    // ---- 分割线 1 (y=180) ----
--    s_divider1 = make_rect(s_scr, 20, 182, 200, 1, t->hud_line);
-+    // ---- 分割线 1 (y=182) ----
-+    s_divider1 = make_rect(parent, 20, 182, 200, 1, t->hud_line);
- 
-     // ---- 日期星期 (y=190-220) ----
--    s_date_label = lv_label_create(s_scr);
-+    s_date_label = lv_label_create(parent);
-     lv_obj_set_pos(s_date_label, 20, 192);
-     lv_label_set_text(s_date_label, "2024-01-01");
-     lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_16, 0);
-     set_text_color(s_date_label, t->text_dim);
- 
--    s_weekday_label = lv_label_create(s_scr);
-+    s_weekday_label = lv_label_create(parent);
-     lv_obj_set_pos(s_weekday_label, 175, 192);
-     lv_label_set_text(s_weekday_label, "MON");
-     lv_obj_set_style_text_font(s_weekday_label, &lv_font_montserrat_16, 0);
-     set_text_color(s_weekday_label, t->primary);
- 
-     // ---- 同步状态+时区 (y=225-245) ----
--    s_status_label = lv_label_create(s_scr);
-+    s_status_label = lv_label_create(parent);
-     lv_obj_set_pos(s_status_label, 20, 228);
-     lv_label_set_text(s_status_label, "NOT SYNCED  UTC+0");
-     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_14, 0);
-     set_text_color(s_status_label, t->warn);
- 
-     // 运行时间（右侧）
--    s_uptime_label = lv_label_create(s_scr);
-+    s_uptime_label = lv_label_create(parent);
-     lv_obj_set_pos(s_uptime_label, 165, 228);
-     lv_label_set_text(s_uptime_label, "UP 00:00");
-     lv_obj_set_style_text_font(s_uptime_label, &lv_font_montserrat_14, 0);
-     set_text_color(s_uptime_label, t->text_dim);
- 
--    // ---- 分割线 2 (y=255) ----
--    s_divider2 = make_rect(s_scr, 20, 258, 200, 1, t->hud_line);
-+    // ---- 分割线 2 (y=258) ----
-+    s_divider2 = make_rect(parent, 20, 258, 200, 1, t->hud_line);
- 
-     // ---- 底部电池区域 (y=268-310) ----
--    // 电池外框
--    s_batt_frame = make_rect(s_scr, 20, 272, 104, 20, t->primary);
-+    s_batt_frame = make_rect(parent, 20, 272, 104, 20, t->primary);
-     lv_obj_set_style_bg_opa(s_batt_frame, LV_OPA_TRANSP, 0);
-     lv_obj_set_style_border_width(s_batt_frame, 2, 0);
-     lv_obj_set_style_border_color(s_batt_frame, lv_color_hex(t->primary), 0);
-     lv_obj_set_style_radius(s_batt_frame, 2, 0);
--    // 电池正极
--    s_batt_cap = make_rect(s_scr, 124, 278, 4, 8, t->primary);
--    // 电池填充（在内框内）
--    s_batt_fill = make_rect(s_scr, 22, 274, 0, 16, t->battery_ok);
--    // 百分比
--    s_batt_pct = lv_label_create(s_scr);
-+    s_batt_cap = make_rect(parent, 124, 278, 4, 8, t->primary);
-+    s_batt_fill = make_rect(parent, 22, 274, 0, 16, t->battery_ok);
-+    s_batt_pct = lv_label_create(parent);
-     lv_obj_set_pos(s_batt_pct, 140, 274);
-     lv_label_set_text(s_batt_pct, "--%");
-     lv_obj_set_style_text_font(s_batt_pct, &lv_font_montserrat_16, 0);
-     set_text_color(s_batt_pct, t->battery_ok);
--    // 电压
--    s_batt_volt = lv_label_create(s_scr);
-+    s_batt_volt = lv_label_create(parent);
-     lv_obj_set_pos(s_batt_volt, 140, 292);
-     lv_label_set_text(s_batt_volt, "--.--V");
-     lv_obj_set_style_text_font(s_batt_volt, &lv_font_montserrat_12, 0);
-     set_text_color(s_batt_volt, t->text_dim);
- 
--    // 侧边刻度线装饰（左侧）
-+    // 侧边刻度线装饰（左右）
-     for (int i = 0; i < 8; i++) {
--        make_rect(s_scr, 2, 50 + i * 30, 2, 12, t->hud_line);
--    }
--    // 侧边刻度线装饰（右侧）
--    for (int i = 0; i < 8; i++) {
--        make_rect(s_scr, 236, 50 + i * 30, 2, 12, t->hud_line);
-+        make_rect(parent, 2, 50 + i * 30, 2, 12, t->hud_line);
-+        make_rect(parent, 236, 50 + i * 30, 2, 12, t->hud_line);
-     }
- }
- 
- // ============================================================================
--// 蓝牙状态栏指示：OFF / ADV / LINK（带缓存，状态不变不重绘）
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++
++    // ---- 内嵌外框（3px 内缩，1px 描边）----
++    s_frame = make_rect(parent, 3, 3, 234, 314, t->hud_line);
++    lv_obj_set_style_bg_opa(s_frame, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(s_frame, 1, 0);
++    lv_obj_set_style_border_color(s_frame, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_opa(s_frame, LV_OPA_TRANSP, 0);
++
++    // ---- 上下刻度尺横条（240x2）----
++    s_ruler_top = make_rect(parent, 0, 0, 240, 2, t->hud_line);
++    s_ruler_bot = make_rect(parent, 0, 318, 240, 2, t->hud_line);
++
++    // ---- 刻度 13 格：x = 20 + i*200/12（四舍五入），中轴 i=6 用主色长格 ----
++    for (int i = 0; i <= 12; i++) {
++        int x = 20 + (i * 200 + 6) / 12;
++        bool mid = (i == 6);
++        int h = mid ? 9 : ((i % 3 == 0) ? 7 : 4);
++        s_ticks_top[i] = make_rect(parent, x, 5, 1, h,
++                                   mid ? t->primary : t->hud_line);
++        if (mid) lv_obj_set_style_bg_opa(s_ticks_top[i], LV_OPA_90, 0);
++        s_ticks_bot[i] = make_rect(parent, x, 317 - h, 1, h,
++                                   mid ? t->primary : t->hud_line);
++        if (mid) lv_obj_set_style_bg_opa(s_ticks_bot[i], LV_OPA_90, 0);
++    }
++
++    // ---- 四角双线角标（8px 边距，14x2 + 2x14）----
++    {
++        static const int cs[8][4] = {
++            { 8, 8, 14, 2 }, { 8, 8, 2, 14 },          // 左上
++            { 218, 8, 14, 2 }, { 230, 8, 2, 14 },      // 右上
++            { 8, 310, 14, 2 }, { 8, 298, 2, 14 },      // 左下
++            { 218, 310, 14, 2 }, { 230, 298, 2, 14 },  // 右下
++        };
++        for (int i = 0; i < 8; i++) {
++            s_corner[i] = make_rect(parent, cs[i][0], cs[i][1],
++                                    cs[i][2], cs[i][3], t->primary);
++        }
++    }
++
++    // ---- 顶栏 y14：型号 / 十六进制流 / 电量%（统一 20px 边距）----
++    s_hdr_model = make_label(parent, 20, 14, &lv_font_montserrat_12, t->text_dim);
++    lv_label_set_text(s_hdr_model, "CC-320");
++    s_hdr_hex = make_label(parent, 0, 14, &lv_font_montserrat_12, t->text_dim);
++    lv_obj_set_width(s_hdr_hex, 240);
++    lv_obj_set_style_text_align(s_hdr_hex, LV_TEXT_ALIGN_CENTER, 0);
++    lv_label_set_text(s_hdr_hex, "0x0000");
++    s_hdr_batt = make_label(parent, 160, 14, &lv_font_montserrat_12, t->text_dim);
++    lv_label_set_text(s_hdr_batt, "--%");
++    label_right_align(s_hdr_batt, 160, 220);
++
++    // ---- 故障切片条（爆发时显示，默认隐藏）----
++    s_slice[0] = make_rect(parent, 0, 0, 40, 2, t->secondary);
++    s_slice[1] = make_rect(parent, 0, 0, 40, 2, t->primary);
++    lv_obj_set_style_bg_opa(s_slice[0], LV_OPA_50, 0);
++    lv_obj_set_style_bg_opa(s_slice[1], LV_OPA_50, 0);
++    lv_obj_add_flag(s_slice[0], LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(s_slice[1], LV_OBJ_FLAG_HIDDEN);
++
++    // ---- 故障色条 3 根（每 3s 换位；墨水屏/精简模式隐藏）----
++    s_gbar[0] = make_rect(parent, 12, 50, 70, 3, t->secondary);
++    s_gbar[1] = make_rect(parent, 150, 128, 56, 2, t->primary);
++    s_gbar[2] = make_rect(parent, 36, 176, 32, 2, t->battery_ok);
++    lv_obj_set_style_bg_opa(s_gbar[0], LV_OPA_70, 0);
++    lv_obj_set_style_bg_opa(s_gbar[1], LV_OPA_50, 0);
++    lv_obj_set_style_bg_opa(s_gbar[2], LV_OPA_60, 0);
++
++    // ---- 时间组：双色差残影 + 主字（48px，压 20px 基准线）----
++    s_time_ghost1 = make_label(parent, 16, 60, &lv_font_montserrat_48, t->secondary);
++    lv_obj_set_style_text_opa(s_time_ghost1, LV_OPA_30, 0);
++    lv_label_set_text(s_time_ghost1, "00:00");
++    s_time_ghost2 = make_label(parent, 26, 63, &lv_font_montserrat_48, t->secondary);
++    lv_obj_set_style_text_opa(s_time_ghost2, GHOST2_OPA, 0);
++    lv_label_set_text(s_time_ghost2, "00:00");
++    s_time_label = make_label(parent, 20, 60, &lv_font_montserrat_48, t->primary);
++    lv_label_set_text(s_time_label, "00:00");
++
++    // ---- 强调线：与时间同起点，124x2 主段 + 84x1 次段 ----
++    s_under1 = make_rect(parent, 20, 120, 124, 2, t->primary);
++    lv_obj_set_style_bg_opa(s_under1, LV_OPA_80, 0);
++    s_under2 = make_rect(parent, 20, 122, 84, 1, t->secondary);
++    lv_obj_set_style_bg_opa(s_under2, LV_OPA_50, 0);
++
++    // ---- 秒：SS 24px + 垂直进度柱（外框 210,66 10x52；填充 212,68 6x48）----
++    s_sec_label = make_label(parent, 162, 72, &lv_font_montserrat_24, t->secondary);
++    lv_label_set_text(s_sec_label, "00");
++    s_secbar_frame = make_rect(parent, 210, 66, 10, 52, t->hud_line);
++    lv_obj_set_style_bg_opa(s_secbar_frame, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(s_secbar_frame, 1, 0);
++    lv_obj_set_style_border_color(s_secbar_frame, lv_color_hex(t->hud_line), 0);
++    s_secbar_fill = make_rect(parent, 212, 68, 6, 48, t->secondary);
++
++    // ---- 分割线 1（y140）：两段 92px，缺口中心 x=120，准星 4x7 ----
++    s_div1_l = make_rect(parent, 20, 140, 92, 1, t->hud_line);
++    s_div1_r = make_rect(parent, 128, 140, 92, 1, t->hud_line);
++    s_div1_n = make_rect(parent, 118, 137, 4, 7, t->secondary);
++    lv_obj_set_style_bg_opa(s_div1_n, LV_OPA_80, 0);
++
++    // ---- 日期行 y152：日期左 / 星期右（右缘 220）----
++    s_date_label = make_label(parent, 20, 152, &lv_font_montserrat_16, t->text_dim);
++    lv_label_set_text(s_date_label, "2026-01-01");
++    s_weekday_label = make_label(parent, 160, 152, &lv_font_montserrat_16, t->primary);
++    lv_label_set_text(s_weekday_label, "THU");
++    label_right_align(s_weekday_label, 160, 220);
++
++    // ---- 频谱条 12 根：x=20+i*17，宽 9，底对齐 y202，高 3-17 随秒起伏 ----
++    for (int i = 0; i < 12; i++) {
++        s_spec[i] = make_rect(parent, 20 + i * 17, 196, 9, 6, t->secondary);
++        // 透明度阶梯 .35/.50/.65/.80（模拟每根亮度差）
++        lv_obj_set_style_bg_opa(s_spec[i], (lv_opa_t)(88 + (i % 4) * 38), 0);
++    }
++
++    // ---- 分割线 2（y212，同规格；准星用主色）----
++    s_div2_l = make_rect(parent, 20, 212, 92, 1, t->hud_line);
++    s_div2_r = make_rect(parent, 128, 212, 92, 1, t->hud_line);
++    s_div2_n = make_rect(parent, 118, 209, 4, 7, t->primary);
++    lv_obj_set_style_bg_opa(s_div2_n, LV_OPA_70, 0);
++
++    // ---- 终端行 y226：> UTC+8_（光标按秒闪烁）----
++    s_term_label = make_label(parent, 20, 226, &lv_font_montserrat_14, t->primary);
++    lv_label_set_text(s_term_label, "> UTC+8_");
++
++    // ---- 像素心形（两组：常规 9x7 @163,228 / 放大 12x10 @162,226）----
++    {
++        static const int sm[7][4] = {
++            { 164, 228, 3, 1 }, { 168, 228, 3, 1 }, { 163, 229, 9, 2 },
++            { 164, 232, 7, 1 }, { 165, 233, 5, 1 }, { 166, 234, 3, 1 },
++            { 167, 235, 1, 1 },
++        };
++        static const int bg[7][4] = {
++            { 163, 226, 4, 2 }, { 169, 226, 4, 2 }, { 162, 228, 12, 3 },
++            { 164, 231, 8, 2 }, { 165, 233, 6, 1 }, { 166, 234, 4, 1 },
++            { 167, 235, 2, 1 },
++        };
++        for (int i = 0; i < 7; i++) {
++            s_heart_sm[i] = make_rect(parent, sm[i][0], sm[i][1],
++                                      sm[i][2], sm[i][3], t->text_dim);
++            s_heart_bg[i] = make_rect(parent, bg[i][0], bg[i][1],
++                                      bg[i][2], bg[i][3], t->text_dim);
++            lv_obj_add_flag(s_heart_bg[i], LV_OBJ_FLAG_HIDDEN);
++        }
++    }
++
++    // ---- 运行时长（心形右侧，右缘对齐 220）----
++    s_uptime_label = make_label(parent, 174, 226, &lv_font_montserrat_14, t->text_dim);
++    lv_label_set_text(s_uptime_label, "00:00");
++    label_right_align(s_uptime_label, 174, 220);
++
++    // ---- 分割线 3（y252，通栏 200px）----
++    s_div3 = make_rect(parent, 20, 252, 200, 1, t->hud_line);
++
++    // ---- 分段电池行 y264-284：外框 104x20（2px 描边）+ 正极 + 10 段 ----
++    s_batt_frame = make_rect(parent, 20, 264, 104, 20, t->primary);
++    lv_obj_set_style_bg_opa(s_batt_frame, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(s_batt_frame, 2, 0);
++    lv_obj_set_style_border_color(s_batt_frame, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_radius(s_batt_frame, 2, 0);
++    s_batt_cap = make_rect(parent, 124, 270, 4, 8, t->primary);
++    for (int i = 0; i < 10; i++) {
++        s_batt_seg[i] = make_rect(parent, 22 + i * 10, 266, 8, 16, t->battery_ok);
++    }
++    s_batt_pct = make_label(parent, 140, 264, &lv_font_montserrat_16, t->battery_ok);
++    lv_label_set_text(s_batt_pct, "--%");
++    s_batt_volt = make_label(parent, 176, 267, &lv_font_montserrat_12, t->text_dim);
++    lv_label_set_text(s_batt_volt, "--.--V");
++    label_right_align(s_batt_volt, 176, 220);
++
++    // ---- 底部十六进制流 y296 ----
++    s_stream2 = make_label(parent, 20, 296, &lv_font_montserrat_12, t->text_dim);
++    lv_label_set_text(s_stream2, ">> 0x000000");
++}
++
++// ============================================================================
 +// 时间同步页 UI
- // ============================================================================
--static void bt_status_update(void)
++// ============================================================================
 +static void build_sync_page(void)
- {
--    if (!s_bt_label) return;
++{
 +    lv_obj_t *parent = s_pg[PAGE_SYNC];
-     const cyber_theme_t *t = &THEMES[s_theme_idx];
--    int st;
--    const char *text;
--    uint32_t color;
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
 +
 +    // 标题
 +    s_sp_title = lv_label_create(parent);
@@ -1397,41 +1699,27 @@ index 48bcc04..570a898 100644
 +    lv_label_set_text(s_sp_status, buf);
 +
 +    // 蓝牙状态（蓝牙只属于本页：OFF 只会出现在启动失败时）
-     if (!s_ble_started) {
--        st = 0; text = "BT OFF"; color = t->text_dim;
++    if (!s_ble_started) {
 +        lv_label_set_text(s_sp_bt, "BT: OFF (USB ONLY)");
 +        set_text_color(s_sp_bt, t->warn);
-     } else {
-         ble_ts_state_t bs = ble_time_sync_get_state();
-         if (bs == BLE_TS_CONNECTED || bs == BLE_TS_SYNCED) {
--            st = 2; text = "BT LINK"; color = t->battery_ok;
++    } else {
++        ble_ts_state_t bs = ble_time_sync_get_state();
++        if (bs == BLE_TS_CONNECTED || bs == BLE_TS_SYNCED) {
 +            lv_label_set_text(s_sp_bt, "BT: LINKED");
 +            set_text_color(s_sp_bt, t->battery_ok);
-         } else {
--            st = 1; text = "BT ADV"; color = t->primary;
++        } else {
 +            lv_label_set_text(s_sp_bt, "BT: ADVERTISING");
 +            set_text_color(s_sp_bt, t->primary);
-         }
-     }
--    if (st != s_bt_disp_state) {
--        s_bt_disp_state = st;
--        lv_label_set_text(s_bt_label, text);
--        set_text_color(s_bt_label, color);
-+
-+    // 底部动作提示
-+    if (s_auto_exit_ms > 0) {
-+        int remain = (int)((s_auto_exit_ms - esp_timer_get_time() / 1000 + 999) / 1000);
-+        if (remain < 0) remain = 0;
-+        snprintf(buf, sizeof(buf), "AUTO EXIT %ds", remain);
-+        set_text_color(s_sp_action, t->battery_ok);
-+    } else if (st.synced) {
-+        snprintf(buf, sizeof(buf), "OK: ENTER CLOCK");
-+        set_text_color(s_sp_action, t->text_dim);
-+    } else {
-+        snprintf(buf, sizeof(buf), "OK: SKIP TO CLOCK");
-+        set_text_color(s_sp_action, t->text_dim);
++        }
 +    }
-+    lv_label_set_text(s_sp_action, buf);
++
++    // 底部动作提示（v9：同步后停留本页，不自动跳转）
++    if (st.synced) {
++        lv_label_set_text(s_sp_action, "OK: ENTER CLOCK");
++    } else {
++        lv_label_set_text(s_sp_action, "OK: SKIP TO CLOCK");
++    }
++    set_text_color(s_sp_action, t->text_dim);
 +}
 +
 +// ============================================================================
@@ -1480,7 +1768,7 @@ index 48bcc04..570a898 100644
 +        lv_label_set_text(s_mp_rows[i], MENU_TITLES[i]);
 +        lv_obj_set_style_text_font(s_mp_rows[i], &lv_font_montserrat_16, 0);
 +        lv_obj_center(s_mp_rows[i]);
-     }
++    }
 +
 +    s_mp_hint1 = lv_label_create(parent);
 +    lv_obj_align(s_mp_hint1, LV_ALIGN_TOP_MID, 0, 260);
@@ -1547,29 +1835,92 @@ index 48bcc04..570a898 100644
 +    lv_label_set_text(s_bp_hint2, "OK: BACK (SAVED)");
 +    lv_obj_set_style_text_font(s_bp_hint2, &lv_font_montserrat_14, 0);
 +    set_text_color(s_bp_hint2, t->text_dim);
- }
- 
- // ============================================================================
--// 主题应用
++}
++
++// ============================================================================
 +// 主题应用（四个页面统一换色）
- // ============================================================================
++// ============================================================================
 +static void update_time_display(void);
 +
- static void apply_theme(void)
- {
-     const cyber_theme_t *t = &THEMES[s_theme_idx];
-     lv_obj_set_style_bg_color(s_scr, lv_color_hex(t->bg), 0);
++static void apply_theme(void)
++{
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++    lv_obj_set_style_bg_color(s_scr, lv_color_hex(t->bg), 0);
 +
-+    // ---- 表盘页 ----
-     set_text_color(s_time_label, t->primary);
-     set_text_color(s_sec_label, t->secondary);
-     set_text_color(s_weekday_label, t->primary);
-@@ -408,13 +715,40 @@ static void apply_theme(void)
-     lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
-     lv_obj_set_style_bg_color(s_divider1, lv_color_hex(t->hud_line), 0);
-     lv_obj_set_style_bg_color(s_divider2, lv_color_hex(t->hud_line), 0);
--    s_bt_disp_state = -1;   // 强制按新主题重绘 BT 状态
--    bt_status_update();
++    // ---- 表盘页（v10 B1++：全元素按主题重着色）----
++    bool eink = theme_is_eink();
++    // 换主题先结束故障爆发，回到常态坐标（避免残留偏移）
++    if (s_glitch_ticks > 0) {
++        s_glitch_ticks = 0;
++        glitch_restore();
++    }
++    // 外框 / 刻度尺 / 刻度
++    lv_obj_set_style_border_color(s_frame, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_ruler_top, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_ruler_bot, lv_color_hex(t->hud_line), 0);
++    for (int i = 0; i <= 12; i++) {
++        bool mid = (i == 6);
++        lv_obj_set_style_bg_color(s_ticks_top[i],
++            lv_color_hex(mid ? t->primary : t->hud_line), 0);
++        lv_obj_set_style_bg_color(s_ticks_bot[i],
++            lv_color_hex(mid ? t->primary : t->hud_line), 0);
++    }
++    // 四角角标 / 顶栏
++    for (int i = 0; i < 8; i++)
++        lv_obj_set_style_bg_color(s_corner[i], lv_color_hex(t->primary), 0);
++    set_text_color(s_hdr_model, t->text_dim);
++    set_text_color(s_hdr_hex, t->text_dim);
++    set_text_color(s_hdr_batt, t->text_dim);
++    // 时间组（墨水屏隐藏双残影）
++    set_text_color(s_time_ghost1, t->secondary);
++    set_text_color(s_time_ghost2, t->secondary);
++    set_text_color(s_time_label, t->primary);
++    lv_obj_set_style_text_opa(s_time_ghost1, LV_OPA_30, 0);
++    lv_obj_set_style_text_opa(s_time_ghost2, GHOST2_OPA, 0);
++    (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_time_ghost1, LV_OBJ_FLAG_HIDDEN);
++    (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_time_ghost2, LV_OBJ_FLAG_HIDDEN);
++    // 强调线 / 秒区
++    lv_obj_set_style_bg_color(s_under1, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_bg_color(s_under2, lv_color_hex(t->secondary), 0);
++    set_text_color(s_sec_label, t->secondary);
++    lv_obj_set_style_border_color(s_secbar_frame, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_secbar_fill, lv_color_hex(t->secondary), 0);
++    // 分割线 1/2/3 + 准星
++    lv_obj_set_style_bg_color(s_div1_l, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_div1_r, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_div1_n, lv_color_hex(t->secondary), 0);
++    lv_obj_set_style_bg_color(s_div2_l, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_div2_r, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_bg_color(s_div2_n, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_bg_color(s_div3, lv_color_hex(t->hud_line), 0);
++    // 日期行 / 频谱 / 终端行
++    set_text_color(s_date_label, t->text_dim);
++    set_text_color(s_weekday_label, t->primary);
++    for (int i = 0; i < 12; i++)
++        lv_obj_set_style_bg_color(s_spec[i], lv_color_hex(t->secondary), 0);
++    set_text_color(s_term_label, t->primary);
++    // 心形（两组同色）/ 运行时长
++    for (int i = 0; i < 7; i++) {
++        lv_obj_set_style_bg_color(s_heart_sm[i], lv_color_hex(t->text_dim), 0);
++        lv_obj_set_style_bg_color(s_heart_bg[i], lv_color_hex(t->text_dim), 0);
++    }
++    set_text_color(s_uptime_label, t->text_dim);
++    // 故障色条 / 切片（墨水屏隐藏）
++    lv_obj_set_style_bg_color(s_gbar[0], lv_color_hex(t->secondary), 0);
++    lv_obj_set_style_bg_color(s_gbar[1], lv_color_hex(t->primary), 0);
++    lv_obj_set_style_bg_color(s_gbar[2], lv_color_hex(t->battery_ok), 0);
++    lv_obj_set_style_bg_color(s_slice[0], lv_color_hex(t->secondary), 0);
++    lv_obj_set_style_bg_color(s_slice[1], lv_color_hex(t->primary), 0);
++    for (int i = 0; i < 3; i++) {
++        if (eink || !mode_is_full())
++            lv_obj_add_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
++        else
++            lv_obj_clear_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
++    }
++    // 电池 / 底流
++    lv_obj_set_style_border_color(s_batt_frame, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
++    set_text_color(s_stream2, t->text_dim);
 +
 +    // ---- 同步页 ----
 +    set_text_color(s_sp_title, t->primary);
@@ -1597,31 +1948,106 @@ index 48bcc04..570a898 100644
 +    lv_obj_set_style_bg_color(s_bp_fill, lv_color_hex(t->primary), 0);
 +
 +    // 状态相关颜色由各刷新函数按同步/BT 状态重设
-     battery_update();
++    battery_update();
 +    update_time_display();
 +    sync_page_update();
- }
- 
- // ============================================================================
--// 时间显示更新
++}
++
++// ============================================================================
 +// 表盘页时间显示更新
- // ============================================================================
- static void update_time_display(void)
- {
-@@ -432,7 +766,7 @@ static void update_time_display(void)
-     lv_label_set_text(s_time_label, buf);
- 
-     // 未同步时时间主文字闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
--    // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或蓝牙任一方式）。
-+    // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或同步页蓝牙任一方式）。
-     lv_obj_set_style_text_opa(s_time_label,
-         (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
- 
-@@ -473,56 +807,102 @@ static void update_time_display(void)
- }
- 
- // ============================================================================
--// 定时器回调（每秒触发）
++// ============================================================================
++static void update_time_display(void)
++{
++    time_t now = time_manager_get_unix_utc();
++    time_manager_state_t st = time_manager_get_state();
++    time_t local = now + st.tz_offset;
++    struct tm tm;
++    localtime_r(&local, &tm);
++
++    // HH:MM（主字 + 双色差残影同步刷新）
++    // 48 字节：容纳各格式理论最大值（含终端行 "> UTC-12_"、底流 ">> 0xFFFFFF"）
++    char buf[48];
++    snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
++    lv_label_set_text(s_time_label, buf);
++    lv_label_set_text(s_time_ghost1, buf);
++    lv_label_set_text(s_time_ghost2, buf);
++
++    // 未同步时时间主文字呼吸闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
++    // 粗略旧值，不可信；闪烁提醒用户需要对时（v7 保留，墨水屏同样适用）
++    lv_obj_set_style_text_opa(s_time_label,
++        (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
++
++    // SS + 秒进度柱（内高 48px，本分钟已过秒数自下而上填充）
++    snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
++    lv_label_set_text(s_sec_label, buf);
++    {
++        int bar_h = ((tm.tm_sec + 1) * 48) / 60;
++        if (bar_h < 0) bar_h = 0;
++        if (bar_h > 48) bar_h = 48;
++        lv_obj_set_height(s_secbar_fill, bar_h);
++        lv_obj_set_y(s_secbar_fill, 68 + (48 - bar_h));
++    }
++
++    // 日期 / 星期
++    snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
++             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
++    lv_label_set_text(s_date_label, buf);
++    lv_label_set_text(s_weekday_label, WEEKDAYS[tm.tm_wday]);
++
++    // 终端行：> UTC+8 光标按秒闪烁（奇数秒显示 _）
++    int tz_hours = st.tz_offset / 3600;
++    if (tm.tm_sec % 2) {
++        snprintf(buf, sizeof(buf), "> UTC%+d_", tz_hours);
++    } else {
++        snprintf(buf, sizeof(buf), "> UTC%+d ", tz_hours);
++    }
++    lv_label_set_text(s_term_label, buf);
++
++    // 心跳运行时长（HH:MM，小时封顶 99 防越界挤占心形）
++    int64_t uptime_us = esp_timer_get_time() - s_enter_time;
++    int uptime_sec = (int)(uptime_us / 1000000);
++    int up_h = uptime_sec / 3600;
++    if (up_h > 99) up_h = 99;
++    snprintf(buf, sizeof(buf), "%02d:%02d", up_h, (uptime_sec % 3600) / 60);
++    lv_label_set_text(s_uptime_label, buf);
++
++    // 十六进制数据流：顶栏 4 位 / 底流 6 位（取 unix 时间戳高位）
++    {
++        uint32_t ts = (uint32_t)now;
++        snprintf(buf, sizeof(buf), "0x%04X", (unsigned)(ts >> 16));
++        lv_label_set_text(s_hdr_hex, buf);
++        snprintf(buf, sizeof(buf), ">> 0x%06X", (unsigned)(ts >> 8));
++        lv_label_set_text(s_stream2, buf);
++    }
++
++    // 频谱条：12 根随秒数确定性起伏（3-17px，底对齐 y202）
++    for (int i = 0; i < 12; i++) {
++        int v = 3 + (int)((sinf(tm.tm_sec * 2.1f + i * 1.7f) + 1.0f) * 7.0f);
++        if (v < 3) v = 3;
++        if (v > 17) v = 17;
++        lv_obj_set_height(s_spec[i], v);
++        lv_obj_set_y(s_spec[i], 202 - v);
++    }
++
++    // ---- 100ms 级动效的秒级触发 ----
++    // 心跳：每秒重开一轮（phase0 = 立即放大）
++    s_beat_phase = 0;
++    heart_set(true);
++
++    bool eink = theme_is_eink();
++    bool full = mode_is_full();
++    // 故障色条换位：每 3s（墨水屏/精简模式无故障元素）
++    if (!eink && full && tm.tm_sec % 3 == 0) {
++        gbar_shuffle(tm.tm_sec);
++    }
++    // 故障爆发：约 7s 一次（秒数 %7==3），持续 3 个 tick（300ms）
++    if (!eink && full && tm.tm_sec % 7 == 3) {
++        glitch_apply(tm.tm_sec);
++        s_glitch_ticks = 3;
++    }
++}
++
++// ============================================================================
 +// 页面切换（只在 LVGL 上下文调用：tick / 按键回调均已持 bsp_lvgl 锁）
 +// ============================================================================
 +static void page_switch(app_page_t next)
@@ -1635,7 +2061,6 @@ index 48bcc04..570a898 100644
 +            ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
 +            s_ble_started = false;
 +        }
-+        s_auto_exit_ms = 0;
 +    }
 +
 +    s_page = next;
@@ -1667,77 +2092,55 @@ index 48bcc04..570a898 100644
 +
 +// ============================================================================
 +// 定时器回调（每 100ms 触发）
- // ============================================================================
- static void tick(lv_timer_t *timer)
- {
-     (void)timer;
-     // BLE 同步回调运行在 NimBLE host 任务：LVGL 非线程安全且彼时未持
--    // bsp_lvgl 锁，直接调 update_time_display() 会与 LVGL 任务的渲染
--    // 并发操作 LVGL 堆，导致死锁/堆损坏（表现为写入成功后整机卡死）。
++// ============================================================================
++// 表盘 100ms 级动效：心跳相位推进 + 故障爆发倒计时
++// （先推进动效、后处理秒变化：秒边界当拍由 update_time_display 起搏，
++//   随后每个 100ms tick 各推进一相，形成 lub-dub 双跳节奏）
++static void clock_fx_tick(void)
++{
++    // 心跳：0→复位 1→弱跳(dub) 2→复位 3→静止
++    switch (s_beat_phase) {
++    case 0: heart_set(false); s_beat_phase = 1; break;  // +100ms 复位
++    case 1: heart_set(true);  s_beat_phase = 2; break;  // +200ms 第二跳
++    case 2: heart_set(false); s_beat_phase = 3; break;  // +300ms 复位
++    case 3: s_beat_phase = 4; break;                    // 静止
++    default: break;
++    }
++    // 故障爆发：3 个 tick（300ms）后恢复常态
++    if (s_glitch_ticks > 0 && --s_glitch_ticks == 0) {
++        glitch_restore();
++    }
++}
++
++static void tick(lv_timer_t *timer)
++{
++    (void)timer;
++    // BLE 同步回调运行在 NimBLE host 任务：LVGL 非线程安全且彼时未持
 +    // bsp_lvgl 锁，直接调 UI 刷新会与 LVGL 任务的渲染并发操作 LVGL 堆，
 +    // 导致死锁/堆损坏（表现为写入成功后整机卡死）。
-     // 因此回调只置标志，在这里（LVGL 定时器上下文，已持锁）完成刷新。
-     if (s_sync_pending) {
-         s_sync_pending = false;
-         s_last_sec = -1;   // 强制立即刷新显示
-     }
- 
--    time_t now = time_manager_get_unix_utc();
-     time_manager_state_t st = time_manager_get_state();
--    time_t local = now + st.tz_offset;
--    struct tm tm;
--    localtime_r(&local, &tm);
-+    int64_t now_ms = esp_timer_get_time() / 1000;
- 
--    // ---- BLE 功耗策略（v6，全部在 LVGL 上下文执行，跨任务安全）----
--    // 1) 新同步事件（BLE / USB 写时间都会让 sync_count 自增）：
--    //    安排 5 秒后自动关蓝牙，给对端留出收最终通知、回读状态的时间。
-+    // ---- 新同步事件边沿检测（BLE / USB 写时间都会让 sync_count 自增）----
-+    // 只有在同步页才安排"5 秒后自动进表盘"（顺带关 BLE 省电）；
-+    // 在其他页面收到同步事件（如表盘页 USB 对时）只刷新时间，不跳页面。
-     if (st.sync_count != s_last_sync_count) {
-         s_last_sync_count = st.sync_count;
--        if (s_ble_started && s_ble_off_deadline_ms == 0) {
--            s_ble_off_deadline_ms = esp_timer_get_time() / 1000 + BLE_AUTO_OFF_DELAY_MS;
--            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动关闭 BLE 省电",
--                     BLE_AUTO_OFF_DELAY_MS / 1000);
-+        if (s_page == PAGE_SYNC && s_auto_exit_ms == 0) {
-+            s_auto_exit_ms = now_ms + SYNC_AUTO_EXIT_MS;
-+            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动进入表盘并关闭 BLE",
-+                     SYNC_AUTO_EXIT_MS / 1000);
-         }
-     }
--    // 2) 到点自动关：断开连接、停广播、释放 NimBLE（stop 为同步操作）。
--    if (s_ble_off_deadline_ms > 0 &&
--        (esp_timer_get_time() / 1000) >= s_ble_off_deadline_ms) {
--        s_ble_off_deadline_ms = 0;
--        if (s_ble_started) {
--            ble_time_sync_stop();
--            s_ble_started = false;
--            ESP_LOGI(TAG, "同步完成，BLE 已自动关闭（OK 键可重新开启）");
--        }
++    // 因此回调只置标志，在这里（LVGL 定时器上下文，已持锁）完成刷新。
++    if (s_sync_pending) {
++        s_sync_pending = false;
++        s_last_sec = -1;   // 强制立即刷新显示
++    }
 +
-+    // ---- 到点自动离开同步页 ----
-+    if (s_auto_exit_ms > 0 && now_ms >= s_auto_exit_ms) {
-+        s_auto_exit_ms = 0;
-+        page_switch(PAGE_CLOCK);   // 内部会停 BLE
-+        return;
-     }
--    // 3) 状态栏 BT 指示
--    bt_status_update();
++    // v9：同步成功后不再自动跳转——同步页就是"对时工作台"，停留本页持续
++    // 显示 BT: LINKED 与 SYNCED 状态，由用户按 OK 手动进表盘（蓝牙随离页关闭）。
++
++    // ---- 表盘 100ms 级动效（先于秒变化处理，见函数头注释）----
++    if (s_page == PAGE_CLOCK) {
++        clock_fx_tick();
++    }
 +
 +    // ---- 每秒刷新当前页面 ----
++    time_manager_state_t st = time_manager_get_state();
 +    time_t now = time_manager_get_unix_utc();
 +    time_t local = now + st.tz_offset;
 +    struct tm tm;
 +    localtime_r(&local, &tm);
- 
-     if (tm.tm_sec != s_last_sec) {
-         s_last_sec = tm.tm_sec;
--        update_time_display();
--        // 每 5 秒刷新电池
--        if (tm.tm_sec % 5 == 0) {
--            battery_refresh();
++
++    if (tm.tm_sec != s_last_sec) {
++        s_last_sec = tm.tm_sec;
 +        if (s_page == PAGE_CLOCK) {
 +            update_time_display();
 +            // 每 5 秒刷新电池
@@ -1746,22 +2149,32 @@ index 48bcc04..570a898 100644
 +            }
 +        } else if (s_page == PAGE_SYNC) {
 +            sync_page_update();
-         }
-     }
- }
-@@ -542,29 +922,45 @@ static void on_ble_sync(void)
- // ============================================================================
- void demo_cyber_clock_enter(void)
- {
--    ESP_LOGI(TAG, "进入赛博朋克时钟");
-+    ESP_LOGI(TAG, "进入赛博朋克时钟（v8 四页面动线）");
-     s_enter_time = esp_timer_get_time();
-     s_last_sec = -1;
-     s_batt_soc = -1;
-     s_theme_idx = 0;
-     s_mode = MODE_FULL;
++        }
++    }
++}
++
++// ============================================================================
++// BLE 同步回调
++// ============================================================================
++static void on_ble_sync(void)
++{
++    // 运行在 NimBLE host 任务中，禁止直接调用任何 LVGL API（见 tick() 内注释）。
++    ESP_LOGI(TAG, "BLE 时间同步完成");
++    s_sync_pending = true;
++}
++
++// ============================================================================
++// 进入/退出
++// ============================================================================
++void demo_cyber_clock_enter(void)
++{
++    ESP_LOGI(TAG, "进入赛博朋克时钟（v10 B1++ 表盘）");
++    s_enter_time = esp_timer_get_time();
++    s_last_sec = -1;
++    s_batt_soc = -1;
++    s_theme_idx = 0;
++    s_mode = MODE_FULL;
 +    s_menu_sel = 0;
-+    s_auto_exit_ms = 0;
 +    brightness_load();
 +
 +    // 根屏幕 + 四个页面容器（互斥显示，切换即隐藏其余）
@@ -1779,61 +2192,79 @@ index 48bcc04..570a898 100644
 +    build_clock_page();
 +    build_menu_page();
 +    build_bright_page();
- 
--    build_ui();
-     lv_scr_load(s_scr);
- 
++
++    lv_scr_load(s_scr);
++
 +    // 应用持久化的亮度（main.c 先设了 100%，这里恢复用户设定）
 +    brightness_apply();
 +
-     // 初始化电池读数
-     battery_refresh();
--    update_time_display();
- 
--    // 启动 BLE 时间同步服务
--    esp_err_t err = ble_time_sync_start();
--    if (err == ESP_OK) {
--        s_ble_started = true;
--        ble_time_sync_set_sync_callback(on_ble_sync);
--        ESP_LOGI(TAG, "BLE 时间同步服务已启动");
--    } else {
--        ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));
--    }
++    // 初始化电池读数
++    battery_refresh();
++
 +    // BLE 同步回调只注册一次（跨页面共用）
 +    ble_time_sync_set_sync_callback(on_ble_sync);
 +
 +    // 开机首屏：时间同步页（内部自动开启 BLE）
 +    page_switch(PAGE_SYNC);
- 
-     // 启动 LVGL 定时器（100ms 间隔，内部判断秒数变化）
-     s_timer = lv_timer_create(tick, 100, NULL);
-@@ -581,11 +977,13 @@ void demo_cyber_clock_exit(void)
-         ble_time_sync_stop();
-         s_ble_started = false;
-     }
--    s_ble_off_deadline_ms = 0;
-+    s_auto_exit_ms = 0;
-     if (s_scr) {
-         lv_obj_del(s_scr);
-         s_scr = NULL;
-     }
++
++    // 启动 LVGL 定时器（100ms 间隔，内部判断秒数变化）
++    s_timer = lv_timer_create(tick, 100, NULL);
++}
++
++void demo_cyber_clock_exit(void)
++{
++    ESP_LOGI(TAG, "退出赛博朋克时钟");
++    if (s_timer) {
++        lv_timer_delete(s_timer);
++        s_timer = NULL;
++    }
++    if (s_ble_started) {
++        ble_time_sync_stop();
++        s_ble_started = false;
++    }
++    if (s_scr) {
++        lv_obj_del(s_scr);
++        s_scr = NULL;
++    }
 +    memset(s_pg, 0, sizeof(s_pg));
 +
-     s_time_label = NULL;
-     s_sec_label = NULL;
-     s_date_label = NULL;
-@@ -594,7 +992,6 @@ void demo_cyber_clock_exit(void)
-     s_uptime_label = NULL;
-     s_sync_icon = NULL;
-     s_sync_label = NULL;
--    s_bt_label = NULL;
-     s_batt_icon_top = NULL;
-     s_batt_frame = NULL;
-     s_batt_fill = NULL;
-@@ -604,59 +1001,110 @@ void demo_cyber_clock_exit(void)
-     s_divider1 = NULL;
-     s_divider2 = NULL;
-     memset(s_corners, 0, sizeof(s_corners));
++    s_time_label = NULL;
++    s_time_ghost1 = NULL;
++    s_time_ghost2 = NULL;
++    s_sec_label = NULL;
++    s_secbar_frame = NULL;
++    s_secbar_fill = NULL;
++    s_date_label = NULL;
++    s_weekday_label = NULL;
++    s_term_label = NULL;
++    s_uptime_label = NULL;
++    s_stream2 = NULL;
++    s_hdr_model = NULL;
++    s_hdr_hex = NULL;
++    s_hdr_batt = NULL;
++    s_under1 = NULL;
++    s_under2 = NULL;
++    s_div1_l = NULL; s_div1_r = NULL; s_div1_n = NULL;
++    s_div2_l = NULL; s_div2_r = NULL; s_div2_n = NULL;
++    s_div3 = NULL;
++    s_frame = NULL;
++    s_ruler_top = NULL;
++    s_ruler_bot = NULL;
++    memset(s_ticks_top, 0, sizeof(s_ticks_top));
++    memset(s_ticks_bot, 0, sizeof(s_ticks_bot));
++    memset(s_corner, 0, sizeof(s_corner));
++    memset(s_spec, 0, sizeof(s_spec));
++    memset(s_heart_sm, 0, sizeof(s_heart_sm));
++    memset(s_heart_bg, 0, sizeof(s_heart_bg));
++    memset(s_gbar, 0, sizeof(s_gbar));
++    memset(s_slice, 0, sizeof(s_slice));
++    s_batt_frame = NULL;
++    s_batt_cap = NULL;
++    memset(s_batt_seg, 0, sizeof(s_batt_seg));
++    s_batt_pct = NULL;
++    s_batt_volt = NULL;
++    s_glitch_ticks = 0;
++    s_beat_phase = 4;
 +
 +    s_sp_title = NULL;
 +    s_sp_time = NULL;
@@ -1860,14 +2291,13 @@ index 48bcc04..570a898 100644
 +    s_bp_hint1 = NULL;
 +    s_bp_hint2 = NULL;
 +    s_bp_div = NULL;
- }
- 
- // ============================================================================
--// 按键处理
++}
++
++// ============================================================================
 +// 按键处理（按页面分发；已由 main.c 持 bsp_lvgl 锁后转发）
- // ============================================================================
- void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
- {
++// ============================================================================
++void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
++{
 +    // ---- OK 长按：全局"上一层"导航 ----
 +    //   表盘/同步页 → 菜单页；菜单页 → 表盘；亮度页 → 菜单页
 +    if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
@@ -1876,74 +2306,42 @@ index 48bcc04..570a898 100644
 +        else                                             page_switch(PAGE_MENU);
 +        return;
 +    }
-     if (ev != BSP_BTN_CLICK) return;
- 
--    switch (btn) {
--    case BSP_BTN_UP:
--        // 切换配色主题
--        s_theme_idx = (s_theme_idx + 1) % THEME_COUNT;
--        ESP_LOGI(TAG, "切换主题: %d", s_theme_idx);
--        apply_theme();
--        update_time_display();
++    if (ev != BSP_BTN_CLICK) return;
++
 +    switch (s_page) {
 +
 +    case PAGE_SYNC:
 +        // OK：跳过等待，直接进表盘（同步页长按也可去菜单）
 +        if (btn == BSP_BTN_OK) page_switch(PAGE_CLOCK);
-         break;
- 
--    case BSP_BTN_DOWN:
--        // 切换显示模式
--        s_mode = (s_mode + 1) % MODE_COUNT;
--        ESP_LOGI(TAG, "切换模式: %d", s_mode);
--        if (s_mode == MODE_MINIMAL) {
--            // 精简模式：隐藏部分信息
--            lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
--            lv_obj_add_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
--            lv_obj_add_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
--        } else {
--            // 完整模式
--            lv_obj_clear_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
--            lv_obj_clear_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
--            lv_obj_clear_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
++        break;
++
 +    case PAGE_CLOCK:
 +        // 表盘页没有蓝牙，也不提供同步功能（都在同步页）
 +        if (btn == BSP_BTN_UP) {
-+            // 切换配色主题
++            // 切换配色主题（0 霓虹 → 1 墨水屏 → 2 青绿 → 3 橙红 → 4 矩阵绿）
 +            s_theme_idx = (s_theme_idx + 1) % THEME_COUNT;
 +            ESP_LOGI(TAG, "切换主题: %d", s_theme_idx);
 +            apply_theme();
 +        } else if (btn == BSP_BTN_DOWN) {
-+            // 切换显示模式
++            // 切换显示模式：完整 / 精简（隐藏顶栏流、频谱、底流、故障色条）
 +            s_mode = (s_mode + 1) % MODE_COUNT;
 +            ESP_LOGI(TAG, "切换模式: %d", s_mode);
-+            if (s_mode == MODE_MINIMAL) {
-+                lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
-+                lv_obj_add_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
-+                lv_obj_add_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
-+            } else {
-+                lv_obj_clear_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
-+                lv_obj_clear_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
-+                lv_obj_clear_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
++            bool hide = (s_mode == MODE_MINIMAL);
++            for (int i = 0; i < 12; i++) {
++                (hide ? lv_obj_add_flag : lv_obj_clear_flag)(s_spec[i], LV_OBJ_FLAG_HIDDEN);
 +            }
-         }
-         break;
- 
--    case BSP_BTN_OK:
--        // 短按：手动开关 BLE（默认策略下同步后蓝牙已关，此键随时开启再同步）
--        if (s_ble_started) {
--            ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
--            s_ble_started = false;
--            s_ble_off_deadline_ms = 0;
--            ESP_LOGI(TAG, "BLE 已手动关闭");
--        } else {
--            esp_err_t err = ble_time_sync_start();
--            if (err == ESP_OK) {
--                s_ble_started = true;
--                s_ble_off_deadline_ms = 0;
--                ESP_LOGI(TAG, "BLE 已手动开启（等待连接/同步）");
--            } else {
--                ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));
++            for (int i = 0; i < 3; i++) {
++                // 精简模式隐藏故障色条；恢复时墨水屏仍保持隐藏
++                if (hide || theme_is_eink())
++                    lv_obj_add_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
++                else
++                    lv_obj_clear_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
++            }
++            (hide ? lv_obj_add_flag : lv_obj_clear_flag)(s_hdr_hex, LV_OBJ_FLAG_HIDDEN);
++            (hide ? lv_obj_add_flag : lv_obj_clear_flag)(s_stream2, LV_OBJ_FLAG_HIDDEN);
++        }
++        break;
++
 +    case PAGE_MENU:
 +        if (btn == BSP_BTN_UP) {
 +            s_menu_sel = (s_menu_sel + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
@@ -1957,9 +2355,8 @@ index 48bcc04..570a898 100644
 +            case 1: page_switch(PAGE_BRIGHT); break;  // 2 亮度调整
 +            case 2: page_switch(PAGE_SYNC); break;    // 3 时间同步
 +            default: break;
-             }
-         }
--        bt_status_update();
++            }
++        }
 +        break;
 +
 +    case PAGE_BRIGHT:
@@ -1976,300 +2373,9 @@ index 48bcc04..570a898 100644
 +        } else if (btn == BSP_BTN_OK) {
 +            page_switch(PAGE_MENU);
 +        }
-         break;
- 
-     default:
-diff --git a/main/main.c b/main/main.c
-index 5b363e2..6a096a2 100644
---- a/main/main.c
-+++ b/main/main.c
-@@ -78,30 +78,14 @@ static void enter_menu(void) {
- }
- 
- // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
-+// v8 起开机直进 CyberClock 应用(同步页→表盘→菜单的页面状态机由 cyber_clock.c
-+// 自管),所有按键直接转发,不再经过 demo 菜单。
- static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
-     (void)user;
-     if (!bsp_lvgl_lock(500)) return;
- 
-     if (s_active >= 0) {
--        if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
--            DEMOS[s_active].exit();
--            enter_menu();
--        } else {
--            DEMOS[s_active].key(btn, ev);
--        }
--    } else if (ev == BSP_BTN_CLICK) {
--        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
--        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
--        if (btn == BSP_BTN_OK && s_ok[s_sel]) {
--            s_active = s_sel;
--            ui_pixel_mascot_jump(s_mascot);
--            lv_obj_delete(s_menu_scr);
--            s_menu_scr = NULL;
--            s_mascot = NULL;
--            DEMOS[s_active].enter();
--        } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
--            ui_pixel_mascot_jump(s_mascot);
--        }
-+        DEMOS[s_active].key(btn, ev);   // 长按返回等导航由应用内部处理
-     }
-     bsp_lvgl_unlock();
- }
-@@ -140,7 +124,11 @@ void app_main(void) {
-     s_ok[6] = true;
-     s_ok[7] = true;
- 
--    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
-+    // v8：开机直进 CyberClock 应用首屏（时间同步页）。设备无 RTC 电池，
-+    // 开机时间必然不可信，先进同步页对时是自洽的动线（USB/蓝牙任一同步后
-+    // 自动进入表盘）。上游 demo 菜单代码保留但不再作为入口。
-+    s_active = 0;
-+    if (bsp_lvgl_lock(1000)) { DEMOS[0].enter(); bsp_lvgl_unlock(); }
- 
-     ESP_LOGI(TAG, "就绪:Clock=%d Display=%d Button=%d Audio=%d Battery=%d",
-              s_ok[0], s_ok[1], s_ok[2], s_ok[3], s_ok[4]);
-
-===================================================================
-v9：同步页停留 + 表盘视觉优化（cyber_clock.c 相对 v8 的 diff；网页重构见 tools/cyber-clock-sync/index.html）
-===================================================================
-diff --git a/main/cyber_clock.c b/main/cyber_clock.c
-index 570a898..4ab01b7 100644
---- a/main/cyber_clock.c
-+++ b/main/cyber_clock.c
-@@ -1,9 +1,10 @@
--// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v8 动线重构）
-+// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v8 动线重构 / v9 微调）
- //
--// v8 页面动线（240x320 竖屏，三个实体按键）：
--//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启，USB/蓝牙任一同步成功
--//          后 5 秒自动进入表盘；OK 可立即跳过）
--//   PAGE_CLOCK（表盘页：纯显示，无蓝牙。UP=主题 DOWN=模式 OK长按=菜单）
-+// v8/v9 页面动线（240x320 竖屏，三个实体按键）：
-+//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启；USB/蓝牙任一同步成功后
-+//          停留本页实时显示状态——v9 起不再自动跳转，按 OK 手动进表盘）
-+//   PAGE_CLOCK（表盘页：纯显示，无蓝牙。UP=主题 DOWN=模式 OK长按=菜单。
-+//          v9 视觉优化：时间霓虹残影、秒数垂直进度柱、未同步图标闪烁）
- //   PAGE_MENU（菜单页：1 表盘 / 2 亮度 / 3 时间同步。UP/DOWN 选择，OK 进入，
- //          OK 长按回表盘）
- //   PAGE_BRIGHT（亮度页：UP/DOWN 以 10% 步进调整 10..100，NVS 持久化，
-@@ -109,9 +110,6 @@ typedef enum {
- 
- #define MENU_ITEM_COUNT 3
- 
--// 同步成功后自动进表盘的延迟：给对端留出收最终 FFC2 通知 / 回读状态的时间
--#define SYNC_AUTO_EXIT_MS   5000
--
- // 亮度范围与步进
- #define BRIGHT_MIN   10
- #define BRIGHT_MAX   100
-@@ -132,7 +130,10 @@ static lv_obj_t *s_pg[PAGE_COUNT_];       // 四个页面容器（互斥显示
- 
- // ---- 表盘页控件 ----
- static lv_obj_t *s_time_label;       // HH:MM 大号
-+static lv_obj_t *s_time_shadow;      // 时间霓虹残影（主文字后方的偏移暗影）
- static lv_obj_t *s_sec_label;        // SS 小号
-+static lv_obj_t *s_secbar_frame;     // 秒数垂直进度柱外框（v9）
-+static lv_obj_t *s_secbar_fill;      // 秒数垂直进度柱填充（v9）
- static lv_obj_t *s_date_label;       // 日期
- static lv_obj_t *s_weekday_label;    // 星期
- static lv_obj_t *s_status_label;     // 同步状态+时区
-@@ -190,8 +191,6 @@ static int s_batt_mv = 0;
- static int64_t s_enter_time;
- static bool s_ble_started = false;
- static volatile bool s_sync_pending;      // BLE 同步事件标志（跨任务传递）
--static uint32_t s_last_sync_count;        // 上次看到的同步计数（新同步事件边沿检测）
--static int64_t  s_auto_exit_ms = 0;       // >0：到点自动离开同步页进表盘
- 
- // ============================================================================
- // 工具函数
-@@ -367,6 +366,14 @@ static void build_clock_page(void)
-     make_rect(parent, 224, 15, 2, 3, t->battery_ok);
- 
-     // ---- 时间区域 (y=50-170) ----
-+    // 霓虹残影：先创建（垫底），主文字后创建覆盖其上——错位 3px 的暗色重影
-+    s_time_shadow = lv_label_create(parent);
-+    lv_obj_set_pos(s_time_shadow, 19, 63);
-+    lv_label_set_text(s_time_shadow, "00:00");
-+    lv_obj_set_style_text_font(s_time_shadow, &lv_font_montserrat_48, 0);
-+    set_text_color(s_time_shadow, t->secondary);
-+    lv_obj_set_style_text_opa(s_time_shadow, LV_OPA_20, 0);
++        break;
 +
-     s_time_label = lv_label_create(parent);
-     lv_obj_set_pos(s_time_label, 16, 60);
-     lv_label_set_text(s_time_label, "00:00");
-@@ -380,6 +387,13 @@ static void build_clock_page(void)
-     lv_obj_set_style_text_font(s_sec_label, &lv_font_montserrat_24, 0);
-     set_text_color(s_sec_label, t->secondary);
- 
-+    // 秒数垂直进度柱（v9）：随秒数自下而上填充的发光柱
-+    s_secbar_frame = make_rect(parent, 216, 66, 10, 52, t->primary);
-+    lv_obj_set_style_bg_opa(s_secbar_frame, LV_OPA_TRANSP, 0);
-+    lv_obj_set_style_border_width(s_secbar_frame, 1, 0);
-+    lv_obj_set_style_border_color(s_secbar_frame, lv_color_hex(t->hud_line), 0);
-+    s_secbar_fill = make_rect(parent, 218, 68, 6, 48, t->secondary);
-+
-     // ---- 分割线 1 (y=182) ----
-     s_divider1 = make_rect(parent, 20, 182, 200, 1, t->hud_line);
- 
-@@ -563,20 +577,13 @@ static void sync_page_update(void)
-         }
-     }
- 
--    // 底部动作提示
--    if (s_auto_exit_ms > 0) {
--        int remain = (int)((s_auto_exit_ms - esp_timer_get_time() / 1000 + 999) / 1000);
--        if (remain < 0) remain = 0;
--        snprintf(buf, sizeof(buf), "AUTO EXIT %ds", remain);
--        set_text_color(s_sp_action, t->battery_ok);
--    } else if (st.synced) {
--        snprintf(buf, sizeof(buf), "OK: ENTER CLOCK");
--        set_text_color(s_sp_action, t->text_dim);
-+    // 底部动作提示（v9：同步后停留本页，不自动跳转）
-+    if (st.synced) {
-+        lv_label_set_text(s_sp_action, "OK: ENTER CLOCK");
-     } else {
--        snprintf(buf, sizeof(buf), "OK: SKIP TO CLOCK");
--        set_text_color(s_sp_action, t->text_dim);
-+        lv_label_set_text(s_sp_action, "OK: SKIP TO CLOCK");
-     }
--    lv_label_set_text(s_sp_action, buf);
-+    set_text_color(s_sp_action, t->text_dim);
- }
- 
- // ============================================================================
-@@ -706,7 +713,10 @@ static void apply_theme(void)
- 
-     // ---- 表盘页 ----
-     set_text_color(s_time_label, t->primary);
-+    set_text_color(s_time_shadow, t->secondary);
-     set_text_color(s_sec_label, t->secondary);
-+    lv_obj_set_style_border_color(s_secbar_frame, lv_color_hex(t->hud_line), 0);
-+    lv_obj_set_style_bg_color(s_secbar_fill, lv_color_hex(t->secondary), 0);
-     set_text_color(s_weekday_label, t->primary);
-     set_text_color(s_date_label, t->text_dim);
-     set_text_color(s_sync_label, t->text_dim);
-@@ -758,12 +768,13 @@ static void update_time_display(void)
-     struct tm tm;
-     localtime_r(&local, &tm);
- 
--    // HH:MM
-+    // HH:MM（含霓虹残影同步刷新）
-     // 48 字节：容纳各格式理论最大值（含 "NOT SYNCED UTC%+d" 23 字节、
-     // 日期最坏 35 字节），避免 -Werror=format-truncation 与实际截断。
-     char buf[48];
-     snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
-     lv_label_set_text(s_time_label, buf);
-+    lv_label_set_text(s_time_shadow, buf);
- 
-     // 未同步时时间主文字闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
-     // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或同步页蓝牙任一方式）。
-@@ -774,6 +785,15 @@ static void update_time_display(void)
-     snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
-     lv_label_set_text(s_sec_label, buf);
- 
-+    // 秒数垂直进度柱：内高 48px，本分钟已过秒数自下而上填充（v9）
-+    {
-+        int bar_h = ((tm.tm_sec + 1) * 48) / 60;
-+        if (bar_h < 0) bar_h = 0;
-+        if (bar_h > 48) bar_h = 48;
-+        lv_obj_set_height(s_secbar_fill, bar_h);
-+        lv_obj_set_y(s_secbar_fill, 68 + (48 - bar_h));
++    default:
++        break;
 +    }
-+
-     // 日期
-     snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
-              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-@@ -790,11 +810,15 @@ static void update_time_display(void)
-         lv_label_set_text(s_status_label, buf);
-         set_text_color(s_status_label, t->primary);
-         lv_obj_set_style_bg_color(s_sync_icon, lv_color_hex(t->battery_ok), 0);
-+        lv_obj_set_style_bg_opa(s_sync_icon, LV_OPA_COVER, 0);
-     } else {
-         snprintf(buf, sizeof(buf), "NOT SYNCED  UTC%+d", tz_hours);
-         lv_label_set_text(s_status_label, buf);
-         set_text_color(s_status_label, t->warn);
-         lv_obj_set_style_bg_color(s_sync_icon, lv_color_hex(t->warn), 0);
-+        // 未同步时图标随秒闪烁（与时间文字同相位）
-+        lv_obj_set_style_bg_opa(s_sync_icon,
-+            (tm.tm_sec % 2) ? LV_OPA_40 : LV_OPA_COVER, 0);
-     }
- 
-     // 运行时间（UP HH:MM）
-@@ -820,7 +844,6 @@ static void page_switch(app_page_t next)
-             ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
-             s_ble_started = false;
-         }
--        s_auto_exit_ms = 0;
-     }
- 
-     s_page = next;
-@@ -865,29 +888,11 @@ static void tick(lv_timer_t *timer)
-         s_last_sec = -1;   // 强制立即刷新显示
-     }
- 
--    time_manager_state_t st = time_manager_get_state();
--    int64_t now_ms = esp_timer_get_time() / 1000;
--
--    // ---- 新同步事件边沿检测（BLE / USB 写时间都会让 sync_count 自增）----
--    // 只有在同步页才安排"5 秒后自动进表盘"（顺带关 BLE 省电）；
--    // 在其他页面收到同步事件（如表盘页 USB 对时）只刷新时间，不跳页面。
--    if (st.sync_count != s_last_sync_count) {
--        s_last_sync_count = st.sync_count;
--        if (s_page == PAGE_SYNC && s_auto_exit_ms == 0) {
--            s_auto_exit_ms = now_ms + SYNC_AUTO_EXIT_MS;
--            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动进入表盘并关闭 BLE",
--                     SYNC_AUTO_EXIT_MS / 1000);
--        }
--    }
--
--    // ---- 到点自动离开同步页 ----
--    if (s_auto_exit_ms > 0 && now_ms >= s_auto_exit_ms) {
--        s_auto_exit_ms = 0;
--        page_switch(PAGE_CLOCK);   // 内部会停 BLE
--        return;
--    }
-+    // v9：同步成功后不再自动跳转——同步页就是"对时工作台"，停留本页持续
-+    // 显示 BT: LINKED 与 SYNCED 状态，由用户按 OK 手动进表盘（蓝牙随离页关闭）。
- 
-     // ---- 每秒刷新当前页面 ----
-+    time_manager_state_t st = time_manager_get_state();
-     time_t now = time_manager_get_unix_utc();
-     time_t local = now + st.tz_offset;
-     struct tm tm;
-@@ -922,14 +927,13 @@ static void on_ble_sync(void)
- // ============================================================================
- void demo_cyber_clock_enter(void)
- {
--    ESP_LOGI(TAG, "进入赛博朋克时钟（v8 四页面动线）");
-+    ESP_LOGI(TAG, "进入赛博朋克时钟（v9 四页面动线）");
-     s_enter_time = esp_timer_get_time();
-     s_last_sec = -1;
-     s_batt_soc = -1;
-     s_theme_idx = 0;
-     s_mode = MODE_FULL;
-     s_menu_sel = 0;
--    s_auto_exit_ms = 0;
-     brightness_load();
- 
-     // 根屏幕 + 四个页面容器（互斥显示，切换即隐藏其余）
-@@ -977,7 +981,6 @@ void demo_cyber_clock_exit(void)
-         ble_time_sync_stop();
-         s_ble_started = false;
-     }
--    s_auto_exit_ms = 0;
-     if (s_scr) {
-         lv_obj_del(s_scr);
-         s_scr = NULL;
-@@ -985,7 +988,10 @@ void demo_cyber_clock_exit(void)
-     memset(s_pg, 0, sizeof(s_pg));
- 
-     s_time_label = NULL;
-+    s_time_shadow = NULL;
-     s_sec_label = NULL;
-+    s_secbar_frame = NULL;
-+    s_secbar_fill = NULL;
-     s_date_label = NULL;
-     s_weekday_label = NULL;
-     s_status_label = NULL;
++}

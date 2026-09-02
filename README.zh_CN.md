@@ -8,9 +8,9 @@
 
 支持 **BLE 蓝牙对时** 与 **USB 线对时** 双通道，蓝牙只属于时间同步页（表盘零射频功耗），无需配套 App——手机/Mac 浏览器网页或任意 BLE 调试工具即可完成时间同步。
 
-![固件](https://img.shields.io/badge/firmware-v9-00f0ff) ![芯片](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
+![固件](https://img.shields.io/badge/firmware-v10-00f0ff) ![芯片](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
 
-## 页面动线（v9）
+## 页面动线（v8 起，v10 不变）
 
 ```
 开机 → [TIME SYNC 时间同步页] --按 OK 进表盘（蓝牙关闭）--> [表盘页]
@@ -21,13 +21,14 @@
 
 ## 功能特性
 
-### 赛博朋克时钟 UI（240×320）
-- HUD 风格布局：四角 L 形角标、侧边刻度线、分割线装饰
-- 大字号 `HH:MM` 带错位霓虹残影 + 右侧独立秒数 `SS` + 秒数垂直进度柱（v9）
-- 日期 + 星期 + 时区 + 运行时长
-- 底部电池条 + 百分比 + 电压，低电量红色告警
-- **4 套主题**：霓虹青紫 / 青绿单色 / 橙红暖色 / 矩阵绿
-- **2 种显示模式**：完整信息 / 精简（仅时间+日期+电池）
+### 赛博朋克时钟 UI（240×320，v10 B1++ 定稿表盘）
+- HUD 版式：内嵌外框 + 上下刻度尺 + 四角双线角标；顶栏型号 / 十六进制流 / 电量%；12 根频谱条；10 段分段电池 + 底部十六进制流
+- 大字号 `HH:MM` 带**青/品红双色差残影** + 右侧独立秒数 `SS` + 秒数垂直进度柱
+- 终端行：`> UTC+8_` 闪烁光标 + **像素心形**按秒 lub-dub 双跳 + 运行时长
+- **故障爆发特效**（约 7 秒一次）：残影分离加剧、主字微移轻闪、错位切片条；另有每 3 秒换位的故障色条
+- 日期 + 星期 + 时区 + 低电量红色告警
+- **5 套主题**：霓虹青紫 / **传统墨水屏**（纸白底墨黑字，静态无特效）/ 青绿单色 / 橙红暖色 / 矩阵绿
+- **2 种显示模式**：完整信息 / 精简（仅时间+日期+电池，且禁用故障特效）
 
 ### BLE 蓝牙对时
 - 设备作为 BLE Peripheral 广播，名称 `CyberClock`
@@ -56,13 +57,13 @@
 - 时间与时区持久化到 NVS，重启恢复粗略时间
 - LVGL 跨线程安全设计（BLE 回调仅置标志，UI 刷新全部在 LVGL 定时器上下文）
 
-## 按键操作（v9 按页面分发）
+## 按键操作（v8 起按页面分发）
 
 | 页面 | 按键 | 动作 | 功能 |
 |---|---|---|---|
 | 时间同步页（开机首屏） | OK | 短按 | 进入表盘（同步后停留本页，不自动跳转） |
 | | OK | 长按 | 进入菜单 |
-| 表盘页 | UP | 短按 | 切换配色主题（蓝紫 → 青绿 → 橙红 → 矩阵绿） |
+| 表盘页 | UP | 短按 | 切换配色主题（蓝紫 → 墨水屏 → 青绿 → 橙红 → 矩阵绿 → 循环） |
 | | DOWN | 短按 | 切换显示模式（完整 ⇄ 精简） |
 | | OK | 长按 | 进入菜单 |
 | 菜单页 | UP / DOWN | 短按 | 移动选中项（1 表盘 / 2 亮度 / 3 时间同步） |
@@ -73,7 +74,7 @@
 ## 快速开始
 
 ### 1. 刷固件
-预编译固件（v9）在 [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/)：
+预编译固件（v10）在 [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/)：
 - 浏览器刷写（免安装）：Chrome/Edge 打开官方刷机页——FoloToy [官方刷机页](https://ai-passport.folotoy.cn/tools/web-flasher/)（厂商首选）或 [esptool-js](https://espressif.github.io/esptool-js/)（芯片厂商通用版），连接设备后添加合并固件、地址填 `0x0` 即可——固件直链下载：<https://y2lin.github.io/AP_CyberClock/firmware/FoloToy-AI-Passport-full.bin>
 - 或 esptool：`esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
 
@@ -98,7 +99,7 @@ Web Bluetooth / Web Serial 要求 HTTPS 安全上下文，GitHub Pages 天然满
 
 ```
 main/                          固件源码
-├── cyber_clock.c/h            赛博朋克时钟：四页面状态机（同步/表盘/菜单/亮度）
+├── cyber_clock.c/h            赛博朋克时钟：四页面状态机 + v10 B1++ 定稿表盘（5 主题/故障特效/像素心跳）
 ├── ble_time_sync.c/h           BLE GATT 时间同步服务
 ├── usb_time_sync.c/h           USB Serial/JTAG 文本命令对时
 ├── time_manager.c/h            时间管理：NVS 持久化、时区、同步状态
