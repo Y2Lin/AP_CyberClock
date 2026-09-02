@@ -855,3 +855,1178 @@ v7：重启后如实显示未同步（time_manager.c 与 cyber_clock.c 相对上
          break;
  
      default:
+
+===================================================================
+v8：四页面动线重构（main.c 与 cyber_clock.c 相对 v7 的 diff；cyber_clock.c 为整体重写）
+===================================================================
+diff --git a/main/cyber_clock.c b/main/cyber_clock.c
+index 48bcc04..570a898 100644
+--- a/main/cyber_clock.c
++++ b/main/cyber_clock.c
+@@ -1,33 +1,31 @@
+-// main/cyber_clock.c —— 赛博朋克风格时钟 + BLE 时间同步（v3 方案C布局）
++// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v8 动线重构）
+ //
+-// v3 方案C布局（240x320 竖屏）：
+-//   - 顶部状态栏：蓝牙图标 + 同步状态 + 电池图标
+-//   - 中上部：大号 HH:MM 偏左，右侧小号 SS 秒数 + 垂直发光进度柱
+-//   - 中部：日期 + 星期
+-//   - 中下部：同步状态文字 + 时区
+-//   - 底部：电池电量条 + 百分比 + 电压
+-//   - 装饰：四角 L 形角标、侧边刻度线、简洁电路线条
+-//   - 去掉所有无意义参数文字，只保留有意义的信息
++// v8 页面动线（240x320 竖屏，三个实体按键）：
++//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启，USB/蓝牙任一同步成功
++//          后 5 秒自动进入表盘；OK 可立即跳过）
++//   PAGE_CLOCK（表盘页：纯显示，无蓝牙。UP=主题 DOWN=模式 OK长按=菜单）
++//   PAGE_MENU（菜单页：1 表盘 / 2 亮度 / 3 时间同步。UP/DOWN 选择，OK 进入，
++//          OK 长按回表盘）
++//   PAGE_BRIGHT（亮度页：UP/DOWN 以 10% 步进调整 10..100，NVS 持久化，
++//          OK/长按返回菜单）
+ //
+-// 交互：
+-//   UP   短按：切换配色主题
+-//   DOWN 短按：切换显示模式（精简/完整）
+-//   OK   短按：手动开关 BLE 广播
+-//   OK   长按：返回菜单
+-//
+-// BLE 功耗策略（v6）：
+-//   - 进入时钟页时，仅当"时间不可信"（本次开机未同步过）才自动开启广播
+-//   - 同步成功（无论 BLE 还是 USB 写入）5 秒后自动关闭广播与连接（省电）；
+-//     延迟 5 秒是为了让对端收完最终状态通知、并留出回读时间
+-//   - OK 短按随时手动开/关，手动开启后不会被打断，直到下一次新的同步事件
+-//   - 顶部状态栏 BT 指示当前蓝牙状态（ADV=广播中 / LINK=已连接 / OFF=已关闭）
++// 设计要点：
++//   - 表盘页彻底不再管蓝牙（v6 的"表盘内自动开关广播"策略整体迁移到同步页：
++//     进同步页必开广播，离开同步页即停，同步成功后 5 秒自动跳表盘顺带关 BLE）
++//   - USB 串口对时是常驻服务，任何页面都可完成同步；非同步页收到同步事件
++//     只是时间刷新，不发生页面跳转
++//   - LVGL 线程安全：BLE 回调只置 s_sync_pending 标志，所有 UI 更新都在
++//     LVGL 定时器上下文（已持 bsp_lvgl 锁）完成
++//   - 字体为 montserrat（无中文字形），界面文案一律英文
+ #include "cyber_clock.h"
+ #include "time_manager.h"
+ #include "ble_time_sync.h"
+ #include "bsp_battery.h"
+ #include "bsp_button.h"
++#include "bsp_display.h"
+ #include "esp_log.h"
+ #include "esp_timer.h"
++#include "nvs.h"
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+ #include "lvgl.h"
+@@ -50,7 +48,7 @@ typedef struct {
+ } cyber_theme_t;
+ 
+ static const cyber_theme_t THEMES[] = {
+-    { // 0: 蓝紫双色霓虹（方案C 默认）
++    { // 0: 蓝紫双色霓虹（默认）
+         .bg = 0x0A0A1A,
+         .primary = 0x00FFFF,
+         .secondary = 0xFF00FF,
+@@ -90,7 +88,7 @@ static const cyber_theme_t THEMES[] = {
+ #define THEME_COUNT (sizeof(THEMES) / sizeof(THEMES[0]))
+ 
+ // ============================================================================
+-// 显示模式
++// 显示模式（表盘页）
+ // ============================================================================
+ typedef enum {
+     MODE_FULL = 0,    // 完整信息
+@@ -98,10 +96,41 @@ typedef enum {
+     MODE_COUNT,
+ } display_mode_t;
+ 
++// ============================================================================
++// 页面状态机
++// ============================================================================
++typedef enum {
++    PAGE_SYNC = 0,    // 时间同步页（开机首屏）
++    PAGE_CLOCK,       // 表盘页
++    PAGE_MENU,        // 菜单页
++    PAGE_BRIGHT,      // 亮度页
++    PAGE_COUNT_,
++} app_page_t;
++
++#define MENU_ITEM_COUNT 3
++
++// 同步成功后自动进表盘的延迟：给对端留出收最终 FFC2 通知 / 回读状态的时间
++#define SYNC_AUTO_EXIT_MS   5000
++
++// 亮度范围与步进
++#define BRIGHT_MIN   10
++#define BRIGHT_MAX   100
++#define BRIGHT_STEP  10
++
++// NVS（与 time_manager 同命名空间，NVS 已在其 init 中完成 flash 初始化）
++#define NVS_NS_BRIGHT    "cyber_clk"
++#define NVS_KEY_BRIGHT   "bright"
++
++// 星期名称
++static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
++
+ // ============================================================================
+ // 全局状态
+ // ============================================================================
+ static lv_obj_t *s_scr;
++static lv_obj_t *s_pg[PAGE_COUNT_];       // 四个页面容器（互斥显示）
++
++// ---- 表盘页控件 ----
+ static lv_obj_t *s_time_label;       // HH:MM 大号
+ static lv_obj_t *s_sec_label;        // SS 小号
+ static lv_obj_t *s_date_label;       // 日期
+@@ -109,7 +138,7 @@ static lv_obj_t *s_weekday_label;    // 星期
+ static lv_obj_t *s_status_label;     // 同步状态+时区
+ static lv_obj_t *s_uptime_label;     // 运行时间
+ static lv_obj_t *s_sync_icon;        // 同步状态图标
+-static lv_obj_t *s_sync_label;       // 同步文字
++static lv_obj_t *s_sync_label;       // 顶部 SYNC 文字
+ static lv_obj_t *s_batt_icon_top;    // 顶部电池图标
+ static lv_obj_t *s_batt_frame;       // 底部电池外框
+ static lv_obj_t *s_batt_fill;        // 底部电池填充
+@@ -120,7 +149,39 @@ static lv_obj_t *s_corners[4];       // 四角装饰
+ static lv_obj_t *s_divider1;         // 分割线1
+ static lv_obj_t *s_divider2;         // 分割线2
+ 
++// ---- 同步页控件 ----
++static lv_obj_t *s_sp_title;         // 标题 TIME SYNC
++static lv_obj_t *s_sp_time;          // HH:MM
++static lv_obj_t *s_sp_sec;           // SS
++static lv_obj_t *s_sp_date;          // 日期+星期
++static lv_obj_t *s_sp_status;        // SYNCED / NOT SYNCED
++static lv_obj_t *s_sp_bt;            // 蓝牙状态
++static lv_obj_t *s_sp_hint_usb;      // USB 提示
++static lv_obj_t *s_sp_hint_ble;      // BLE 提示
++static lv_obj_t *s_sp_action;        // 底部动作提示/倒计时
++static lv_obj_t *s_sp_div;           // 分割线
++
++// ---- 菜单页控件 ----
++static lv_obj_t *s_mp_title;
++static lv_obj_t *s_mp_panels[MENU_ITEM_COUNT];
++static lv_obj_t *s_mp_rows[MENU_ITEM_COUNT];
++static lv_obj_t *s_mp_hint1;
++static lv_obj_t *s_mp_hint2;
++static lv_obj_t *s_mp_div;
++
++// ---- 亮度页控件 ----
++static lv_obj_t *s_bp_title;
++static lv_obj_t *s_bp_pct;           // 百分比大字
++static lv_obj_t *s_bp_frame;         // 进度条外框
++static lv_obj_t *s_bp_fill;          // 进度条填充
++static lv_obj_t *s_bp_hint1;
++static lv_obj_t *s_bp_hint2;
++static lv_obj_t *s_bp_div;
++
+ static lv_timer_t *s_timer;
++static app_page_t s_page = PAGE_COUNT_;   // 当前页面（初始哨兵值）
++static int s_menu_sel = 0;                // 菜单选中项
++static uint8_t s_brightness = BRIGHT_MAX; // 当前亮度（10..100）
+ static int s_theme_idx = 0;
+ static display_mode_t s_mode = MODE_FULL;
+ static int s_last_sec = -1;
+@@ -128,20 +189,9 @@ static int s_batt_soc = -1;
+ static int s_batt_mv = 0;
+ static int64_t s_enter_time;
+ static bool s_ble_started = false;
+-static volatile bool s_sync_pending;   // BLE 同步事件标志（跨任务传递）
+-static lv_obj_t *s_bt_label;           // 顶部蓝牙状态文字
+-static uint32_t s_last_sync_count;     // 上次看到的同步计数（新同步事件边沿检测）
+-static int64_t  s_ble_off_deadline_ms; // >0：到点自动关闭 BLE
+-static int      s_bt_disp_state = -1;  // 状态栏 BT 显示缓存（-1 强制刷新）
+-
+-// 同步成功后延迟关 BLE：给对端留出收最终 FFC2 通知 / 回读状态的时间
+-#define BLE_AUTO_OFF_DELAY_MS   5000
+-// "时间可信"判定窗口：本次开机内 1 小时内同步过即可信（重启后单调钟归零，
+-// last_sync_ms 反而变大 → elapsed 为负 → 不可信 → 自动开广播等待重新同步）
+-#define BLE_RELIABLE_WINDOW_S   3600
+-
+-// 星期名称
+-static const char *WEEKDAYS[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
++static volatile bool s_sync_pending;      // BLE 同步事件标志（跨任务传递）
++static uint32_t s_last_sync_count;        // 上次看到的同步计数（新同步事件边沿检测）
++static int64_t  s_auto_exit_ms = 0;       // >0：到点自动离开同步页进表盘
+ 
+ // ============================================================================
+ // 工具函数
+@@ -164,8 +214,54 @@ static void set_text_color(lv_obj_t *label, uint32_t color)
+     lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+ }
+ 
++// 满屏透明页面容器（不滚动、无边框、无内边距）
++static lv_obj_t *make_page_container(void)
++{
++    lv_obj_t *p = lv_obj_create(s_scr);
++    lv_obj_set_pos(p, 0, 0);
++    lv_obj_set_size(p, 240, 320);
++    lv_obj_set_style_bg_opa(p, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(p, 0, 0);
++    lv_obj_set_style_pad_all(p, 0, 0);
++    lv_obj_set_style_radius(p, 0, 0);
++    lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_OFF);
++    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
++    return p;
++}
++
+ // ============================================================================
+-// 电池组件
++// 亮度：加载 / 保存 / 应用
++// ============================================================================
++static void brightness_load(void)
++{
++    nvs_handle_t h;
++    if (nvs_open(NVS_NS_BRIGHT, NVS_READONLY, &h) == ESP_OK) {
++        uint8_t v = 0;
++        if (nvs_get_u8(h, NVS_KEY_BRIGHT, &v) == ESP_OK &&
++            v >= BRIGHT_MIN && v <= BRIGHT_MAX) {
++            s_brightness = v;
++        }
++        nvs_close(h);
++    }
++}
++
++static void brightness_save(void)
++{
++    nvs_handle_t h;
++    if (nvs_open(NVS_NS_BRIGHT, NVS_READWRITE, &h) == ESP_OK) {
++        nvs_set_u8(h, NVS_KEY_BRIGHT, s_brightness);
++        nvs_commit(h);
++        nvs_close(h);
++    }
++}
++
++static void brightness_apply(void)
++{
++    bsp_display_backlight(s_brightness);
++}
++
++// ============================================================================
++// 电池组件（表盘页）
+ // ============================================================================
+ static void battery_update(void)
+ {
+@@ -227,38 +323,32 @@ static void battery_refresh(void)
+ }
+ 
+ // ============================================================================
+-// UI 构建
++// 表盘页 UI
+ // ============================================================================
+-static void build_ui(void)
++static void build_clock_page(void)
+ {
++    lv_obj_t *parent = s_pg[PAGE_CLOCK];
+     const cyber_theme_t *t = &THEMES[s_theme_idx];
+ 
+-    s_scr = lv_obj_create(NULL);
+-    lv_obj_set_style_bg_color(s_scr, lv_color_hex(t->bg), 0);
+-    lv_obj_set_style_bg_opa(s_scr, LV_OPA_COVER, 0);
+-    lv_obj_set_style_border_width(s_scr, 0, 0);
+-    lv_obj_set_style_pad_all(s_scr, 0, 0);
+-
+     // ---- 四角 L 形装饰角标 ----
+     int corner_size = 12;
+     int corner_w = 2;
+     // 左上
+-    s_corners[0] = make_rect(s_scr, 6, 6, corner_size, corner_w, t->hud_line);
+-    make_rect(s_scr, 6, 6, corner_w, corner_size, t->hud_line);
++    s_corners[0] = make_rect(parent, 6, 6, corner_size, corner_w, t->hud_line);
++    make_rect(parent, 6, 6, corner_w, corner_size, t->hud_line);
+     // 右上
+-    s_corners[1] = make_rect(s_scr, 240-6-corner_size, 6, corner_size, corner_w, t->hud_line);
+-    make_rect(s_scr, 240-6-corner_w, 6, corner_w, corner_size, t->hud_line);
++    s_corners[1] = make_rect(parent, 240-6-corner_size, 6, corner_size, corner_w, t->hud_line);
++    make_rect(parent, 240-6-corner_w, 6, corner_w, corner_size, t->hud_line);
+     // 左下
+-    s_corners[2] = make_rect(s_scr, 6, 320-6-corner_w, corner_size, corner_w, t->hud_line);
+-    make_rect(s_scr, 6, 320-6-corner_size, corner_w, corner_size, t->hud_line);
++    s_corners[2] = make_rect(parent, 6, 320-6-corner_w, corner_size, corner_w, t->hud_line);
++    make_rect(parent, 6, 320-6-corner_size, corner_w, corner_size, t->hud_line);
+     // 右下
+-    s_corners[3] = make_rect(s_scr, 240-6-corner_size, 320-6-corner_w, corner_size, corner_w, t->hud_line);
+-    make_rect(s_scr, 240-6-corner_w, 320-6-corner_size, corner_w, corner_size, t->hud_line);
++    s_corners[3] = make_rect(parent, 240-6-corner_size, 320-6-corner_w, corner_size, corner_w, t->hud_line);
++    make_rect(parent, 240-6-corner_w, 320-6-corner_size, corner_w, corner_size, t->hud_line);
+ 
+     // ---- 顶部状态栏 (y=8-28) ----
+-    // 蓝牙文字标识
+-    // 同步状态图标（圆形，左移因为去掉了BT）
+-    s_sync_icon = lv_obj_create(s_scr);
++    // 同步状态图标
++    s_sync_icon = lv_obj_create(parent);
+     lv_obj_set_pos(s_sync_icon, 20, 12);
+     lv_obj_set_size(s_sync_icon, 10, 10);
+     lv_obj_set_style_bg_color(s_sync_icon, lv_color_hex(t->warn), 0);
+@@ -267,137 +357,354 @@ static void build_ui(void)
+     lv_obj_set_style_radius(s_sync_icon, LV_RADIUS_CIRCLE, 0);
+     lv_obj_set_style_pad_all(s_sync_icon, 0, 0);
+     // 同步文字
+-    s_sync_label = lv_label_create(s_scr);
++    s_sync_label = lv_label_create(parent);
+     lv_obj_set_pos(s_sync_label, 36, 10);
+     lv_label_set_text(s_sync_label, "SYNC");
+     lv_obj_set_style_text_font(s_sync_label, &lv_font_montserrat_14, 0);
+     set_text_color(s_sync_label, t->text_dim);
+-    // 顶部电池图标（右移，因为去掉了百分比文字）
+-    s_batt_icon_top = make_rect(s_scr, 210, 13, 14, 7, t->battery_ok);
+-    make_rect(s_scr, 224, 15, 2, 3, t->battery_ok);
+-    // 蓝牙状态文字（电池图标左侧）
+-    s_bt_label = lv_label_create(s_scr);
+-    lv_obj_set_pos(s_bt_label, 150, 10);
+-    lv_label_set_text(s_bt_label, "BT OFF");
+-    lv_obj_set_style_text_font(s_bt_label, &lv_font_montserrat_14, 0);
+-    set_text_color(s_bt_label, t->text_dim);
++    // 顶部电池图标
++    s_batt_icon_top = make_rect(parent, 210, 13, 14, 7, t->battery_ok);
++    make_rect(parent, 224, 15, 2, 3, t->battery_ok);
+ 
+     // ---- 时间区域 (y=50-170) ----
+-    // 大号 HH:MM 偏左
+-    s_time_label = lv_label_create(s_scr);
++    s_time_label = lv_label_create(parent);
+     lv_obj_set_pos(s_time_label, 16, 60);
+     lv_label_set_text(s_time_label, "00:00");
+     lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
+     set_text_color(s_time_label, t->primary);
+ 
+-    // 右侧秒数 SS（去掉垂直进度柱后右移）
+-    s_sec_label = lv_label_create(s_scr);
++    // 右侧秒数 SS
++    s_sec_label = lv_label_create(parent);
+     lv_obj_set_pos(s_sec_label, 180, 72);
+     lv_label_set_text(s_sec_label, "00");
+     lv_obj_set_style_text_font(s_sec_label, &lv_font_montserrat_24, 0);
+     set_text_color(s_sec_label, t->secondary);
+ 
+-    // ---- 分割线 1 (y=180) ----
+-    s_divider1 = make_rect(s_scr, 20, 182, 200, 1, t->hud_line);
++    // ---- 分割线 1 (y=182) ----
++    s_divider1 = make_rect(parent, 20, 182, 200, 1, t->hud_line);
+ 
+     // ---- 日期星期 (y=190-220) ----
+-    s_date_label = lv_label_create(s_scr);
++    s_date_label = lv_label_create(parent);
+     lv_obj_set_pos(s_date_label, 20, 192);
+     lv_label_set_text(s_date_label, "2024-01-01");
+     lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_16, 0);
+     set_text_color(s_date_label, t->text_dim);
+ 
+-    s_weekday_label = lv_label_create(s_scr);
++    s_weekday_label = lv_label_create(parent);
+     lv_obj_set_pos(s_weekday_label, 175, 192);
+     lv_label_set_text(s_weekday_label, "MON");
+     lv_obj_set_style_text_font(s_weekday_label, &lv_font_montserrat_16, 0);
+     set_text_color(s_weekday_label, t->primary);
+ 
+     // ---- 同步状态+时区 (y=225-245) ----
+-    s_status_label = lv_label_create(s_scr);
++    s_status_label = lv_label_create(parent);
+     lv_obj_set_pos(s_status_label, 20, 228);
+     lv_label_set_text(s_status_label, "NOT SYNCED  UTC+0");
+     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_14, 0);
+     set_text_color(s_status_label, t->warn);
+ 
+     // 运行时间（右侧）
+-    s_uptime_label = lv_label_create(s_scr);
++    s_uptime_label = lv_label_create(parent);
+     lv_obj_set_pos(s_uptime_label, 165, 228);
+     lv_label_set_text(s_uptime_label, "UP 00:00");
+     lv_obj_set_style_text_font(s_uptime_label, &lv_font_montserrat_14, 0);
+     set_text_color(s_uptime_label, t->text_dim);
+ 
+-    // ---- 分割线 2 (y=255) ----
+-    s_divider2 = make_rect(s_scr, 20, 258, 200, 1, t->hud_line);
++    // ---- 分割线 2 (y=258) ----
++    s_divider2 = make_rect(parent, 20, 258, 200, 1, t->hud_line);
+ 
+     // ---- 底部电池区域 (y=268-310) ----
+-    // 电池外框
+-    s_batt_frame = make_rect(s_scr, 20, 272, 104, 20, t->primary);
++    s_batt_frame = make_rect(parent, 20, 272, 104, 20, t->primary);
+     lv_obj_set_style_bg_opa(s_batt_frame, LV_OPA_TRANSP, 0);
+     lv_obj_set_style_border_width(s_batt_frame, 2, 0);
+     lv_obj_set_style_border_color(s_batt_frame, lv_color_hex(t->primary), 0);
+     lv_obj_set_style_radius(s_batt_frame, 2, 0);
+-    // 电池正极
+-    s_batt_cap = make_rect(s_scr, 124, 278, 4, 8, t->primary);
+-    // 电池填充（在内框内）
+-    s_batt_fill = make_rect(s_scr, 22, 274, 0, 16, t->battery_ok);
+-    // 百分比
+-    s_batt_pct = lv_label_create(s_scr);
++    s_batt_cap = make_rect(parent, 124, 278, 4, 8, t->primary);
++    s_batt_fill = make_rect(parent, 22, 274, 0, 16, t->battery_ok);
++    s_batt_pct = lv_label_create(parent);
+     lv_obj_set_pos(s_batt_pct, 140, 274);
+     lv_label_set_text(s_batt_pct, "--%");
+     lv_obj_set_style_text_font(s_batt_pct, &lv_font_montserrat_16, 0);
+     set_text_color(s_batt_pct, t->battery_ok);
+-    // 电压
+-    s_batt_volt = lv_label_create(s_scr);
++    s_batt_volt = lv_label_create(parent);
+     lv_obj_set_pos(s_batt_volt, 140, 292);
+     lv_label_set_text(s_batt_volt, "--.--V");
+     lv_obj_set_style_text_font(s_batt_volt, &lv_font_montserrat_12, 0);
+     set_text_color(s_batt_volt, t->text_dim);
+ 
+-    // 侧边刻度线装饰（左侧）
++    // 侧边刻度线装饰（左右）
+     for (int i = 0; i < 8; i++) {
+-        make_rect(s_scr, 2, 50 + i * 30, 2, 12, t->hud_line);
+-    }
+-    // 侧边刻度线装饰（右侧）
+-    for (int i = 0; i < 8; i++) {
+-        make_rect(s_scr, 236, 50 + i * 30, 2, 12, t->hud_line);
++        make_rect(parent, 2, 50 + i * 30, 2, 12, t->hud_line);
++        make_rect(parent, 236, 50 + i * 30, 2, 12, t->hud_line);
+     }
+ }
+ 
+ // ============================================================================
+-// 蓝牙状态栏指示：OFF / ADV / LINK（带缓存，状态不变不重绘）
++// 时间同步页 UI
+ // ============================================================================
+-static void bt_status_update(void)
++static void build_sync_page(void)
+ {
+-    if (!s_bt_label) return;
++    lv_obj_t *parent = s_pg[PAGE_SYNC];
+     const cyber_theme_t *t = &THEMES[s_theme_idx];
+-    int st;
+-    const char *text;
+-    uint32_t color;
++
++    // 标题
++    s_sp_title = lv_label_create(parent);
++    lv_obj_align(s_sp_title, LV_ALIGN_TOP_MID, 0, 18);
++    lv_label_set_text(s_sp_title, "TIME SYNC");
++    lv_obj_set_style_text_font(s_sp_title, &lv_font_montserrat_24, 0);
++    set_text_color(s_sp_title, t->primary);
++
++    // 标题下分割线
++    s_sp_div = make_rect(parent, 20, 54, 200, 1, t->hud_line);
++
++    // 大号时间 HH:MM + 右侧秒
++    s_sp_time = lv_label_create(parent);
++    lv_obj_set_pos(s_sp_time, 28, 84);
++    lv_label_set_text(s_sp_time, "00:00");
++    lv_obj_set_style_text_font(s_sp_time, &lv_font_montserrat_48, 0);
++    set_text_color(s_sp_time, t->primary);
++
++    s_sp_sec = lv_label_create(parent);
++    lv_obj_set_pos(s_sp_sec, 184, 100);
++    lv_label_set_text(s_sp_sec, "00");
++    lv_obj_set_style_text_font(s_sp_sec, &lv_font_montserrat_24, 0);
++    set_text_color(s_sp_sec, t->secondary);
++
++    // 日期+星期
++    s_sp_date = lv_label_create(parent);
++    lv_obj_align(s_sp_date, LV_ALIGN_TOP_MID, 0, 158);
++    lv_label_set_text(s_sp_date, "2024-01-01  MON");
++    lv_obj_set_style_text_font(s_sp_date, &lv_font_montserrat_16, 0);
++    set_text_color(s_sp_date, t->text_dim);
++
++    // 同步状态
++    s_sp_status = lv_label_create(parent);
++    lv_obj_align(s_sp_status, LV_ALIGN_TOP_MID, 0, 190);
++    lv_label_set_text(s_sp_status, "NOT SYNCED");
++    lv_obj_set_style_text_font(s_sp_status, &lv_font_montserrat_16, 0);
++    set_text_color(s_sp_status, t->warn);
++
++    // 蓝牙状态
++    s_sp_bt = lv_label_create(parent);
++    lv_obj_align(s_sp_bt, LV_ALIGN_TOP_MID, 0, 214);
++    lv_label_set_text(s_sp_bt, "BT: ADVERTISING");
++    lv_obj_set_style_text_font(s_sp_bt, &lv_font_montserrat_16, 0);
++    set_text_color(s_sp_bt, t->primary);
++
++    // 两种对时方式提示
++    s_sp_hint_usb = lv_label_create(parent);
++    lv_obj_align(s_sp_hint_usb, LV_ALIGN_TOP_MID, 0, 250);
++    lv_label_set_text(s_sp_hint_usb, "USB: PC WEB TOOL");
++    lv_obj_set_style_text_font(s_sp_hint_usb, &lv_font_montserrat_14, 0);
++    set_text_color(s_sp_hint_usb, t->text_dim);
++
++    s_sp_hint_ble = lv_label_create(parent);
++    lv_obj_align(s_sp_hint_ble, LV_ALIGN_TOP_MID, 0, 270);
++    lv_label_set_text(s_sp_hint_ble, "BLE: PHONE WEB TOOL");
++    lv_obj_set_style_text_font(s_sp_hint_ble, &lv_font_montserrat_14, 0);
++    set_text_color(s_sp_hint_ble, t->text_dim);
++
++    // 底部动作提示（同步成功倒计时期间显示 AUTO EXIT Ns）
++    s_sp_action = lv_label_create(parent);
++    lv_obj_align(s_sp_action, LV_ALIGN_TOP_MID, 0, 294);
++    lv_label_set_text(s_sp_action, "OK: SKIP TO CLOCK");
++    lv_obj_set_style_text_font(s_sp_action, &lv_font_montserrat_14, 0);
++    set_text_color(s_sp_action, t->text_dim);
++}
++
++// 同步页内容刷新（每秒 + 状态变化时调用；只在 LVGL 上下文执行）
++static void sync_page_update(void)
++{
++    time_t now = time_manager_get_unix_utc();
++    time_manager_state_t st = time_manager_get_state();
++    time_t local = now + st.tz_offset;
++    struct tm tm;
++    localtime_r(&local, &tm);
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++    // 40 字节：容纳 "2024-12-31  WED"（15 字节）与状态文案的最大长度
++    char buf[40];
++
++    snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
++    lv_label_set_text(s_sp_time, buf);
++    // 未同步时时间文字闪烁（奇数秒半透明）：显示的是 NVS 恢复的旧值，不可信
++    lv_obj_set_style_text_opa(s_sp_time,
++        (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
++
++    snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
++    lv_label_set_text(s_sp_sec, buf);
++
++    snprintf(buf, sizeof(buf), "%04d-%02d-%02d  %s",
++             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, WEEKDAYS[tm.tm_wday]);
++    lv_label_set_text(s_sp_date, buf);
++
++    // 同步状态
++    int tz_hours = st.tz_offset / 3600;
++    if (st.synced) {
++        snprintf(buf, sizeof(buf), "SYNCED  UTC%+d", tz_hours);
++        set_text_color(s_sp_status, t->battery_ok);
++    } else {
++        snprintf(buf, sizeof(buf), "NOT SYNCED  UTC%+d", tz_hours);
++        set_text_color(s_sp_status, t->warn);
++    }
++    lv_label_set_text(s_sp_status, buf);
++
++    // 蓝牙状态（蓝牙只属于本页：OFF 只会出现在启动失败时）
+     if (!s_ble_started) {
+-        st = 0; text = "BT OFF"; color = t->text_dim;
++        lv_label_set_text(s_sp_bt, "BT: OFF (USB ONLY)");
++        set_text_color(s_sp_bt, t->warn);
+     } else {
+         ble_ts_state_t bs = ble_time_sync_get_state();
+         if (bs == BLE_TS_CONNECTED || bs == BLE_TS_SYNCED) {
+-            st = 2; text = "BT LINK"; color = t->battery_ok;
++            lv_label_set_text(s_sp_bt, "BT: LINKED");
++            set_text_color(s_sp_bt, t->battery_ok);
+         } else {
+-            st = 1; text = "BT ADV"; color = t->primary;
++            lv_label_set_text(s_sp_bt, "BT: ADVERTISING");
++            set_text_color(s_sp_bt, t->primary);
+         }
+     }
+-    if (st != s_bt_disp_state) {
+-        s_bt_disp_state = st;
+-        lv_label_set_text(s_bt_label, text);
+-        set_text_color(s_bt_label, color);
++
++    // 底部动作提示
++    if (s_auto_exit_ms > 0) {
++        int remain = (int)((s_auto_exit_ms - esp_timer_get_time() / 1000 + 999) / 1000);
++        if (remain < 0) remain = 0;
++        snprintf(buf, sizeof(buf), "AUTO EXIT %ds", remain);
++        set_text_color(s_sp_action, t->battery_ok);
++    } else if (st.synced) {
++        snprintf(buf, sizeof(buf), "OK: ENTER CLOCK");
++        set_text_color(s_sp_action, t->text_dim);
++    } else {
++        snprintf(buf, sizeof(buf), "OK: SKIP TO CLOCK");
++        set_text_color(s_sp_action, t->text_dim);
++    }
++    lv_label_set_text(s_sp_action, buf);
++}
++
++// ============================================================================
++// 菜单页 UI
++// ============================================================================
++static const char *MENU_TITLES[MENU_ITEM_COUNT] = {
++    "1 CLOCK", "2 BRIGHTNESS", "3 TIME SYNC",
++};
++
++static void menu_refresh(void)
++{
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++    for (int i = 0; i < MENU_ITEM_COUNT; i++) {
++        bool sel = (i == s_menu_sel);
++        lv_obj_set_style_border_width(s_mp_panels[i], sel ? 2 : 1, 0);
++        lv_obj_set_style_border_color(s_mp_panels[i],
++            lv_color_hex(sel ? t->primary : t->hud_line), 0);
++        set_text_color(s_mp_rows[i], sel ? t->primary : t->text_dim);
++    }
++}
++
++static void build_menu_page(void)
++{
++    lv_obj_t *parent = s_pg[PAGE_MENU];
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++
++    s_mp_title = lv_label_create(parent);
++    lv_obj_align(s_mp_title, LV_ALIGN_TOP_MID, 0, 18);
++    lv_label_set_text(s_mp_title, "MENU");
++    lv_obj_set_style_text_font(s_mp_title, &lv_font_montserrat_24, 0);
++    set_text_color(s_mp_title, t->primary);
++
++    s_mp_div = make_rect(parent, 20, 54, 200, 1, t->hud_line);
++
++    static const int row_y[MENU_ITEM_COUNT] = { 76, 136, 196 };
++    for (int i = 0; i < MENU_ITEM_COUNT; i++) {
++        s_mp_panels[i] = lv_obj_create(parent);
++        lv_obj_set_pos(s_mp_panels[i], 20, row_y[i]);
++        lv_obj_set_size(s_mp_panels[i], 200, 44);
++        lv_obj_set_style_bg_opa(s_mp_panels[i], LV_OPA_TRANSP, 0);
++        lv_obj_set_style_radius(s_mp_panels[i], 2, 0);
++        lv_obj_set_style_pad_all(s_mp_panels[i], 0, 0);
++        lv_obj_clear_flag(s_mp_panels[i], LV_OBJ_FLAG_SCROLLABLE);
++
++        s_mp_rows[i] = lv_label_create(s_mp_panels[i]);
++        lv_label_set_text(s_mp_rows[i], MENU_TITLES[i]);
++        lv_obj_set_style_text_font(s_mp_rows[i], &lv_font_montserrat_16, 0);
++        lv_obj_center(s_mp_rows[i]);
+     }
++
++    s_mp_hint1 = lv_label_create(parent);
++    lv_obj_align(s_mp_hint1, LV_ALIGN_TOP_MID, 0, 260);
++    lv_label_set_text(s_mp_hint1, "UP/DOWN: SELECT");
++    lv_obj_set_style_text_font(s_mp_hint1, &lv_font_montserrat_14, 0);
++    set_text_color(s_mp_hint1, t->text_dim);
++
++    s_mp_hint2 = lv_label_create(parent);
++    lv_obj_align(s_mp_hint2, LV_ALIGN_TOP_MID, 0, 280);
++    lv_label_set_text(s_mp_hint2, "OK: ENTER   LONG: CLOCK");
++    lv_obj_set_style_text_font(s_mp_hint2, &lv_font_montserrat_14, 0);
++    set_text_color(s_mp_hint2, t->text_dim);
++
++    menu_refresh();
++}
++
++// ============================================================================
++// 亮度页 UI
++// ============================================================================
++static void bright_page_update(void)
++{
++    char buf[8];
++    snprintf(buf, sizeof(buf), "%d%%", s_brightness);
++    lv_label_set_text(s_bp_pct, buf);
++    // 进度条内宽 176px（外框 x=30 w=180 border 2）
++    lv_obj_set_width(s_bp_fill, s_brightness * 176 / 100);
++}
++
++static void build_bright_page(void)
++{
++    lv_obj_t *parent = s_pg[PAGE_BRIGHT];
++    const cyber_theme_t *t = &THEMES[s_theme_idx];
++
++    s_bp_title = lv_label_create(parent);
++    lv_obj_align(s_bp_title, LV_ALIGN_TOP_MID, 0, 18);
++    lv_label_set_text(s_bp_title, "BRIGHTNESS");
++    lv_obj_set_style_text_font(s_bp_title, &lv_font_montserrat_24, 0);
++    set_text_color(s_bp_title, t->primary);
++
++    s_bp_div = make_rect(parent, 20, 54, 200, 1, t->hud_line);
++
++    s_bp_pct = lv_label_create(parent);
++    lv_obj_align(s_bp_pct, LV_ALIGN_TOP_MID, 0, 100);
++    lv_label_set_text(s_bp_pct, "100%");
++    lv_obj_set_style_text_font(s_bp_pct, &lv_font_montserrat_48, 0);
++    set_text_color(s_bp_pct, t->primary);
++
++    // 进度条外框 + 填充
++    s_bp_frame = make_rect(parent, 30, 196, 180, 20, t->primary);
++    lv_obj_set_style_bg_opa(s_bp_frame, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(s_bp_frame, 2, 0);
++    lv_obj_set_style_border_color(s_bp_frame, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_radius(s_bp_frame, 2, 0);
++    s_bp_fill = make_rect(parent, 32, 198, 176, 16, t->primary);
++
++    s_bp_hint1 = lv_label_create(parent);
++    lv_obj_align(s_bp_hint1, LV_ALIGN_TOP_MID, 0, 248);
++    lv_label_set_text(s_bp_hint1, "UP/DOWN: ADJUST 10-100");
++    lv_obj_set_style_text_font(s_bp_hint1, &lv_font_montserrat_14, 0);
++    set_text_color(s_bp_hint1, t->text_dim);
++
++    s_bp_hint2 = lv_label_create(parent);
++    lv_obj_align(s_bp_hint2, LV_ALIGN_TOP_MID, 0, 270);
++    lv_label_set_text(s_bp_hint2, "OK: BACK (SAVED)");
++    lv_obj_set_style_text_font(s_bp_hint2, &lv_font_montserrat_14, 0);
++    set_text_color(s_bp_hint2, t->text_dim);
+ }
+ 
+ // ============================================================================
+-// 主题应用
++// 主题应用（四个页面统一换色）
+ // ============================================================================
++static void update_time_display(void);
++
+ static void apply_theme(void)
+ {
+     const cyber_theme_t *t = &THEMES[s_theme_idx];
+     lv_obj_set_style_bg_color(s_scr, lv_color_hex(t->bg), 0);
++
++    // ---- 表盘页 ----
+     set_text_color(s_time_label, t->primary);
+     set_text_color(s_sec_label, t->secondary);
+     set_text_color(s_weekday_label, t->primary);
+@@ -408,13 +715,40 @@ static void apply_theme(void)
+     lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
+     lv_obj_set_style_bg_color(s_divider1, lv_color_hex(t->hud_line), 0);
+     lv_obj_set_style_bg_color(s_divider2, lv_color_hex(t->hud_line), 0);
+-    s_bt_disp_state = -1;   // 强制按新主题重绘 BT 状态
+-    bt_status_update();
++
++    // ---- 同步页 ----
++    set_text_color(s_sp_title, t->primary);
++    set_text_color(s_sp_time, t->primary);
++    set_text_color(s_sp_sec, t->secondary);
++    set_text_color(s_sp_date, t->text_dim);
++    set_text_color(s_sp_hint_usb, t->text_dim);
++    set_text_color(s_sp_hint_ble, t->text_dim);
++    lv_obj_set_style_bg_color(s_sp_div, lv_color_hex(t->hud_line), 0);
++
++    // ---- 菜单页 ----
++    set_text_color(s_mp_title, t->primary);
++    set_text_color(s_mp_hint1, t->text_dim);
++    set_text_color(s_mp_hint2, t->text_dim);
++    lv_obj_set_style_bg_color(s_mp_div, lv_color_hex(t->hud_line), 0);
++    menu_refresh();
++
++    // ---- 亮度页 ----
++    set_text_color(s_bp_title, t->primary);
++    set_text_color(s_bp_pct, t->primary);
++    set_text_color(s_bp_hint1, t->text_dim);
++    set_text_color(s_bp_hint2, t->text_dim);
++    lv_obj_set_style_bg_color(s_bp_div, lv_color_hex(t->hud_line), 0);
++    lv_obj_set_style_border_color(s_bp_frame, lv_color_hex(t->primary), 0);
++    lv_obj_set_style_bg_color(s_bp_fill, lv_color_hex(t->primary), 0);
++
++    // 状态相关颜色由各刷新函数按同步/BT 状态重设
+     battery_update();
++    update_time_display();
++    sync_page_update();
+ }
+ 
+ // ============================================================================
+-// 时间显示更新
++// 表盘页时间显示更新
+ // ============================================================================
+ static void update_time_display(void)
+ {
+@@ -432,7 +766,7 @@ static void update_time_display(void)
+     lv_label_set_text(s_time_label, buf);
+ 
+     // 未同步时时间主文字闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
+-    // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或蓝牙任一方式）。
++    // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或同步页蓝牙任一方式）。
+     lv_obj_set_style_text_opa(s_time_label,
+         (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
+ 
+@@ -473,56 +807,102 @@ static void update_time_display(void)
+ }
+ 
+ // ============================================================================
+-// 定时器回调（每秒触发）
++// 页面切换（只在 LVGL 上下文调用：tick / 按键回调均已持 bsp_lvgl 锁）
++// ============================================================================
++static void page_switch(app_page_t next)
++{
++    if (next == s_page) return;
++
++    // ---- 退出当前页 ----
++    if (s_page == PAGE_SYNC) {
++        // 离开同步页即关蓝牙：表盘/菜单/亮度页都不需要 BLE（v8 动线核心）
++        if (s_ble_started) {
++            ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
++            s_ble_started = false;
++        }
++        s_auto_exit_ms = 0;
++    }
++
++    s_page = next;
++    for (int i = 0; i < PAGE_COUNT_; i++) {
++        if (i == (int)next) lv_obj_clear_flag(s_pg[i], LV_OBJ_FLAG_HIDDEN);
++        else                lv_obj_add_flag(s_pg[i], LV_OBJ_FLAG_HIDDEN);
++    }
++    s_last_sec = -1;   // 强制新页面立即刷新
++
++    // ---- 进入新页面 ----
++    if (next == PAGE_SYNC) {
++        // 同步页专属：开启 BLE 广播等待对时（手动从菜单进入也重新开）
++        esp_err_t err = ble_time_sync_start();
++        if (err == ESP_OK) {
++            s_ble_started = true;
++            ESP_LOGI(TAG, "进入同步页，BLE 广播已开启");
++        } else {
++            s_ble_started = false;
++            ESP_LOGE(TAG, "BLE 启动失败（可改用 USB 对时）: %s", esp_err_to_name(err));
++        }
++        sync_page_update();
++    } else if (next == PAGE_CLOCK) {
++        update_time_display();
++    } else if (next == PAGE_BRIGHT) {
++        bright_page_update();
++    }
++    // 菜单页为静态内容，无需刷新
++}
++
++// ============================================================================
++// 定时器回调（每 100ms 触发）
+ // ============================================================================
+ static void tick(lv_timer_t *timer)
+ {
+     (void)timer;
+     // BLE 同步回调运行在 NimBLE host 任务：LVGL 非线程安全且彼时未持
+-    // bsp_lvgl 锁，直接调 update_time_display() 会与 LVGL 任务的渲染
+-    // 并发操作 LVGL 堆，导致死锁/堆损坏（表现为写入成功后整机卡死）。
++    // bsp_lvgl 锁，直接调 UI 刷新会与 LVGL 任务的渲染并发操作 LVGL 堆，
++    // 导致死锁/堆损坏（表现为写入成功后整机卡死）。
+     // 因此回调只置标志，在这里（LVGL 定时器上下文，已持锁）完成刷新。
+     if (s_sync_pending) {
+         s_sync_pending = false;
+         s_last_sec = -1;   // 强制立即刷新显示
+     }
+ 
+-    time_t now = time_manager_get_unix_utc();
+     time_manager_state_t st = time_manager_get_state();
+-    time_t local = now + st.tz_offset;
+-    struct tm tm;
+-    localtime_r(&local, &tm);
++    int64_t now_ms = esp_timer_get_time() / 1000;
+ 
+-    // ---- BLE 功耗策略（v6，全部在 LVGL 上下文执行，跨任务安全）----
+-    // 1) 新同步事件（BLE / USB 写时间都会让 sync_count 自增）：
+-    //    安排 5 秒后自动关蓝牙，给对端留出收最终通知、回读状态的时间。
++    // ---- 新同步事件边沿检测（BLE / USB 写时间都会让 sync_count 自增）----
++    // 只有在同步页才安排"5 秒后自动进表盘"（顺带关 BLE 省电）；
++    // 在其他页面收到同步事件（如表盘页 USB 对时）只刷新时间，不跳页面。
+     if (st.sync_count != s_last_sync_count) {
+         s_last_sync_count = st.sync_count;
+-        if (s_ble_started && s_ble_off_deadline_ms == 0) {
+-            s_ble_off_deadline_ms = esp_timer_get_time() / 1000 + BLE_AUTO_OFF_DELAY_MS;
+-            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动关闭 BLE 省电",
+-                     BLE_AUTO_OFF_DELAY_MS / 1000);
++        if (s_page == PAGE_SYNC && s_auto_exit_ms == 0) {
++            s_auto_exit_ms = now_ms + SYNC_AUTO_EXIT_MS;
++            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动进入表盘并关闭 BLE",
++                     SYNC_AUTO_EXIT_MS / 1000);
+         }
+     }
+-    // 2) 到点自动关：断开连接、停广播、释放 NimBLE（stop 为同步操作）。
+-    if (s_ble_off_deadline_ms > 0 &&
+-        (esp_timer_get_time() / 1000) >= s_ble_off_deadline_ms) {
+-        s_ble_off_deadline_ms = 0;
+-        if (s_ble_started) {
+-            ble_time_sync_stop();
+-            s_ble_started = false;
+-            ESP_LOGI(TAG, "同步完成，BLE 已自动关闭（OK 键可重新开启）");
+-        }
++
++    // ---- 到点自动离开同步页 ----
++    if (s_auto_exit_ms > 0 && now_ms >= s_auto_exit_ms) {
++        s_auto_exit_ms = 0;
++        page_switch(PAGE_CLOCK);   // 内部会停 BLE
++        return;
+     }
+-    // 3) 状态栏 BT 指示
+-    bt_status_update();
++
++    // ---- 每秒刷新当前页面 ----
++    time_t now = time_manager_get_unix_utc();
++    time_t local = now + st.tz_offset;
++    struct tm tm;
++    localtime_r(&local, &tm);
+ 
+     if (tm.tm_sec != s_last_sec) {
+         s_last_sec = tm.tm_sec;
+-        update_time_display();
+-        // 每 5 秒刷新电池
+-        if (tm.tm_sec % 5 == 0) {
+-            battery_refresh();
++        if (s_page == PAGE_CLOCK) {
++            update_time_display();
++            // 每 5 秒刷新电池
++            if (tm.tm_sec % 5 == 0) {
++                battery_refresh();
++            }
++        } else if (s_page == PAGE_SYNC) {
++            sync_page_update();
+         }
+     }
+ }
+@@ -542,29 +922,45 @@ static void on_ble_sync(void)
+ // ============================================================================
+ void demo_cyber_clock_enter(void)
+ {
+-    ESP_LOGI(TAG, "进入赛博朋克时钟");
++    ESP_LOGI(TAG, "进入赛博朋克时钟（v8 四页面动线）");
+     s_enter_time = esp_timer_get_time();
+     s_last_sec = -1;
+     s_batt_soc = -1;
+     s_theme_idx = 0;
+     s_mode = MODE_FULL;
++    s_menu_sel = 0;
++    s_auto_exit_ms = 0;
++    brightness_load();
++
++    // 根屏幕 + 四个页面容器（互斥显示，切换即隐藏其余）
++    s_scr = lv_obj_create(NULL);
++    lv_obj_set_style_bg_color(s_scr, lv_color_hex(THEMES[0].bg), 0);
++    lv_obj_set_style_bg_opa(s_scr, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_width(s_scr, 0, 0);
++    lv_obj_set_style_pad_all(s_scr, 0, 0);
++
++    for (int i = 0; i < PAGE_COUNT_; i++) {
++        s_pg[i] = make_page_container();
++        lv_obj_add_flag(s_pg[i], LV_OBJ_FLAG_HIDDEN);
++    }
++    build_sync_page();
++    build_clock_page();
++    build_menu_page();
++    build_bright_page();
+ 
+-    build_ui();
+     lv_scr_load(s_scr);
+ 
++    // 应用持久化的亮度（main.c 先设了 100%，这里恢复用户设定）
++    brightness_apply();
++
+     // 初始化电池读数
+     battery_refresh();
+-    update_time_display();
+ 
+-    // 启动 BLE 时间同步服务
+-    esp_err_t err = ble_time_sync_start();
+-    if (err == ESP_OK) {
+-        s_ble_started = true;
+-        ble_time_sync_set_sync_callback(on_ble_sync);
+-        ESP_LOGI(TAG, "BLE 时间同步服务已启动");
+-    } else {
+-        ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));
+-    }
++    // BLE 同步回调只注册一次（跨页面共用）
++    ble_time_sync_set_sync_callback(on_ble_sync);
++
++    // 开机首屏：时间同步页（内部自动开启 BLE）
++    page_switch(PAGE_SYNC);
+ 
+     // 启动 LVGL 定时器（100ms 间隔，内部判断秒数变化）
+     s_timer = lv_timer_create(tick, 100, NULL);
+@@ -581,11 +977,13 @@ void demo_cyber_clock_exit(void)
+         ble_time_sync_stop();
+         s_ble_started = false;
+     }
+-    s_ble_off_deadline_ms = 0;
++    s_auto_exit_ms = 0;
+     if (s_scr) {
+         lv_obj_del(s_scr);
+         s_scr = NULL;
+     }
++    memset(s_pg, 0, sizeof(s_pg));
++
+     s_time_label = NULL;
+     s_sec_label = NULL;
+     s_date_label = NULL;
+@@ -594,7 +992,6 @@ void demo_cyber_clock_exit(void)
+     s_uptime_label = NULL;
+     s_sync_icon = NULL;
+     s_sync_label = NULL;
+-    s_bt_label = NULL;
+     s_batt_icon_top = NULL;
+     s_batt_frame = NULL;
+     s_batt_fill = NULL;
+@@ -604,59 +1001,110 @@ void demo_cyber_clock_exit(void)
+     s_divider1 = NULL;
+     s_divider2 = NULL;
+     memset(s_corners, 0, sizeof(s_corners));
++
++    s_sp_title = NULL;
++    s_sp_time = NULL;
++    s_sp_sec = NULL;
++    s_sp_date = NULL;
++    s_sp_status = NULL;
++    s_sp_bt = NULL;
++    s_sp_hint_usb = NULL;
++    s_sp_hint_ble = NULL;
++    s_sp_action = NULL;
++    s_sp_div = NULL;
++
++    s_mp_title = NULL;
++    memset(s_mp_panels, 0, sizeof(s_mp_panels));
++    memset(s_mp_rows, 0, sizeof(s_mp_rows));
++    s_mp_hint1 = NULL;
++    s_mp_hint2 = NULL;
++    s_mp_div = NULL;
++
++    s_bp_title = NULL;
++    s_bp_pct = NULL;
++    s_bp_frame = NULL;
++    s_bp_fill = NULL;
++    s_bp_hint1 = NULL;
++    s_bp_hint2 = NULL;
++    s_bp_div = NULL;
+ }
+ 
+ // ============================================================================
+-// 按键处理
++// 按键处理（按页面分发；已由 main.c 持 bsp_lvgl 锁后转发）
+ // ============================================================================
+ void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
+ {
++    // ---- OK 长按：全局"上一层"导航 ----
++    //   表盘/同步页 → 菜单页；菜单页 → 表盘；亮度页 → 菜单页
++    if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
++        if (s_page == PAGE_CLOCK || s_page == PAGE_SYNC) page_switch(PAGE_MENU);
++        else if (s_page == PAGE_MENU)                    page_switch(PAGE_CLOCK);
++        else                                             page_switch(PAGE_MENU);
++        return;
++    }
+     if (ev != BSP_BTN_CLICK) return;
+ 
+-    switch (btn) {
+-    case BSP_BTN_UP:
+-        // 切换配色主题
+-        s_theme_idx = (s_theme_idx + 1) % THEME_COUNT;
+-        ESP_LOGI(TAG, "切换主题: %d", s_theme_idx);
+-        apply_theme();
+-        update_time_display();
++    switch (s_page) {
++
++    case PAGE_SYNC:
++        // OK：跳过等待，直接进表盘（同步页长按也可去菜单）
++        if (btn == BSP_BTN_OK) page_switch(PAGE_CLOCK);
+         break;
+ 
+-    case BSP_BTN_DOWN:
+-        // 切换显示模式
+-        s_mode = (s_mode + 1) % MODE_COUNT;
+-        ESP_LOGI(TAG, "切换模式: %d", s_mode);
+-        if (s_mode == MODE_MINIMAL) {
+-            // 精简模式：隐藏部分信息
+-            lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
+-            lv_obj_add_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
+-            lv_obj_add_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
+-        } else {
+-            // 完整模式
+-            lv_obj_clear_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
+-            lv_obj_clear_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
+-            lv_obj_clear_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
++    case PAGE_CLOCK:
++        // 表盘页没有蓝牙，也不提供同步功能（都在同步页）
++        if (btn == BSP_BTN_UP) {
++            // 切换配色主题
++            s_theme_idx = (s_theme_idx + 1) % THEME_COUNT;
++            ESP_LOGI(TAG, "切换主题: %d", s_theme_idx);
++            apply_theme();
++        } else if (btn == BSP_BTN_DOWN) {
++            // 切换显示模式
++            s_mode = (s_mode + 1) % MODE_COUNT;
++            ESP_LOGI(TAG, "切换模式: %d", s_mode);
++            if (s_mode == MODE_MINIMAL) {
++                lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
++                lv_obj_add_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
++                lv_obj_add_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
++            } else {
++                lv_obj_clear_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
++                lv_obj_clear_flag(s_batt_volt, LV_OBJ_FLAG_HIDDEN);
++                lv_obj_clear_flag(s_divider2, LV_OBJ_FLAG_HIDDEN);
++            }
+         }
+         break;
+ 
+-    case BSP_BTN_OK:
+-        // 短按：手动开关 BLE（默认策略下同步后蓝牙已关，此键随时开启再同步）
+-        if (s_ble_started) {
+-            ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
+-            s_ble_started = false;
+-            s_ble_off_deadline_ms = 0;
+-            ESP_LOGI(TAG, "BLE 已手动关闭");
+-        } else {
+-            esp_err_t err = ble_time_sync_start();
+-            if (err == ESP_OK) {
+-                s_ble_started = true;
+-                s_ble_off_deadline_ms = 0;
+-                ESP_LOGI(TAG, "BLE 已手动开启（等待连接/同步）");
+-            } else {
+-                ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));
++    case PAGE_MENU:
++        if (btn == BSP_BTN_UP) {
++            s_menu_sel = (s_menu_sel + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
++            menu_refresh();
++        } else if (btn == BSP_BTN_DOWN) {
++            s_menu_sel = (s_menu_sel + 1) % MENU_ITEM_COUNT;
++            menu_refresh();
++        } else if (btn == BSP_BTN_OK) {
++            switch (s_menu_sel) {
++            case 0: page_switch(PAGE_CLOCK); break;   // 1 进入表盘
++            case 1: page_switch(PAGE_BRIGHT); break;  // 2 亮度调整
++            case 2: page_switch(PAGE_SYNC); break;    // 3 时间同步
++            default: break;
+             }
+         }
+-        bt_status_update();
++        break;
++
++    case PAGE_BRIGHT:
++        if (btn == BSP_BTN_UP && s_brightness < BRIGHT_MAX) {
++            s_brightness += BRIGHT_STEP;
++            brightness_apply();
++            brightness_save();   // 即时持久化，返回时无需确认
++            bright_page_update();
++        } else if (btn == BSP_BTN_DOWN && s_brightness > BRIGHT_MIN) {
++            s_brightness -= BRIGHT_STEP;
++            brightness_apply();
++            brightness_save();
++            bright_page_update();
++        } else if (btn == BSP_BTN_OK) {
++            page_switch(PAGE_MENU);
++        }
+         break;
+ 
+     default:
+diff --git a/main/main.c b/main/main.c
+index 5b363e2..6a096a2 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -78,30 +78,14 @@ static void enter_menu(void) {
+ }
+ 
+ // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
++// v8 起开机直进 CyberClock 应用(同步页→表盘→菜单的页面状态机由 cyber_clock.c
++// 自管),所有按键直接转发,不再经过 demo 菜单。
+ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+     (void)user;
+     if (!bsp_lvgl_lock(500)) return;
+ 
+     if (s_active >= 0) {
+-        if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
+-            DEMOS[s_active].exit();
+-            enter_menu();
+-        } else {
+-            DEMOS[s_active].key(btn, ev);
+-        }
+-    } else if (ev == BSP_BTN_CLICK) {
+-        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
+-        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
+-        if (btn == BSP_BTN_OK && s_ok[s_sel]) {
+-            s_active = s_sel;
+-            ui_pixel_mascot_jump(s_mascot);
+-            lv_obj_delete(s_menu_scr);
+-            s_menu_scr = NULL;
+-            s_mascot = NULL;
+-            DEMOS[s_active].enter();
+-        } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
+-            ui_pixel_mascot_jump(s_mascot);
+-        }
++        DEMOS[s_active].key(btn, ev);   // 长按返回等导航由应用内部处理
+     }
+     bsp_lvgl_unlock();
+ }
+@@ -140,7 +124,11 @@ void app_main(void) {
+     s_ok[6] = true;
+     s_ok[7] = true;
+ 
+-    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
++    // v8：开机直进 CyberClock 应用首屏（时间同步页）。设备无 RTC 电池，
++    // 开机时间必然不可信，先进同步页对时是自洽的动线（USB/蓝牙任一同步后
++    // 自动进入表盘）。上游 demo 菜单代码保留但不再作为入口。
++    s_active = 0;
++    if (bsp_lvgl_lock(1000)) { DEMOS[0].enter(); bsp_lvgl_unlock(); }
+ 
+     ESP_LOGI(TAG, "就绪:Clock=%d Display=%d Button=%d Audio=%d Battery=%d",
+              s_ok[0], s_ok[1], s_ok[2], s_ok[3], s_ok[4]);

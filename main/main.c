@@ -78,30 +78,14 @@ static void enter_menu(void) {
 }
 
 // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
+// v8 起开机直进 CyberClock 应用(同步页→表盘→菜单的页面状态机由 cyber_clock.c
+// 自管),所有按键直接转发,不再经过 demo 菜单。
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)user;
     if (!bsp_lvgl_lock(500)) return;
 
     if (s_active >= 0) {
-        if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
-            DEMOS[s_active].exit();
-            enter_menu();
-        } else {
-            DEMOS[s_active].key(btn, ev);
-        }
-    } else if (ev == BSP_BTN_CLICK) {
-        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
-        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
-        if (btn == BSP_BTN_OK && s_ok[s_sel]) {
-            s_active = s_sel;
-            ui_pixel_mascot_jump(s_mascot);
-            lv_obj_delete(s_menu_scr);
-            s_menu_scr = NULL;
-            s_mascot = NULL;
-            DEMOS[s_active].enter();
-        } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
-            ui_pixel_mascot_jump(s_mascot);
-        }
+        DEMOS[s_active].key(btn, ev);   // 长按返回等导航由应用内部处理
     }
     bsp_lvgl_unlock();
 }
@@ -140,7 +124,11 @@ void app_main(void) {
     s_ok[6] = true;
     s_ok[7] = true;
 
-    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
+    // v8：开机直进 CyberClock 应用首屏（时间同步页）。设备无 RTC 电池，
+    // 开机时间必然不可信，先进同步页对时是自洽的动线（USB/蓝牙任一同步后
+    // 自动进入表盘）。上游 demo 菜单代码保留但不再作为入口。
+    s_active = 0;
+    if (bsp_lvgl_lock(1000)) { DEMOS[0].enter(); bsp_lvgl_unlock(); }
 
     ESP_LOGI(TAG, "就绪:Clock=%d Display=%d Button=%d Audio=%d Battery=%d",
              s_ok[0], s_ok[1], s_ok[2], s_ok[3], s_ok[4]);

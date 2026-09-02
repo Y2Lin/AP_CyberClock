@@ -150,16 +150,17 @@
         <label class="chk"><input type="checkbox" id="nameFilter">仅显示名称含 CyberClock 的设备</label>
       </div>
       <p class="note" style="margin-top:12px">
-        先在设备上进入 <b>CyberClock 页面</b>，再点击连接。<b>设备蓝牙状态看屏幕右上角</b>：
-        <b>BT ADV</b>=广播中（可直接连）、<b>BT LINK</b>=已连接、<b>BT OFF</b>=已关闭。<br>
-        <b>v6 省电策略</b>：设备时间未同步时进入时钟页会自动开广播；<b>已同步则默认关闭蓝牙省电</b>
-        ——此时要在设备上<b>短按 OK 键</b>打开蓝牙（屏幕变为 BT ADV）再连接。<br>
-        <b>同步成功约 5 秒后设备会自动断开并关闭蓝牙</b>（正常现象，不是故障）；需要再同步就按 OK 键重新打开。<br>
+        设备<b>开机即进入 TIME SYNC 时间同步页</b>（若已在表盘页：长按 OK 键 → 菜单选 <b>3 TIME SYNC</b>），
+        蓝牙自动开始广播，即可点击连接。<b>同步页屏幕中央显示蓝牙状态</b>：
+        <b>BT: ADVERTISING</b>=广播中（可直接连）、<b>BT: LINKED</b>=已连接。<br>
+        <b>v8 动线</b>：蓝牙仅在时间同步页开启（表盘页不耗蓝牙电）；
+        <b>同步成功约 5 秒后设备自动进入表盘并断开蓝牙</b>（正常现象，不是故障）。<br>
+        需要再次同步：设备上<b>长按 OK 键 → 3 TIME SYNC</b> 回到同步页，蓝牙自动重开。<br>
         <b>Mac 找不到设备？最省事的办法：直接改用顶部“USB 线同步”标签页</b>（插线即可，不依赖蓝牙）。<br>
         想继续走蓝牙，先做交叉验证（金标准）：Mac 设备选择框保持打开的同时，用安卓 nRF Connect
         <b>只扫描不连接</b>——手机此刻能看到 CyberClock 而 Mac 看不到，说明设备广播正常、问题在 Mac 侧。然后按顺序排查：<br>
         ① 确认安卓手机已<b>断开连接</b>（BLE 同一时间只允许一个中心设备连接，被占用时设备不广播）；
-        且设备屏幕显示 <b>BT ADV</b>（BT OFF 时按 OK 键打开）；<br>
+        且设备同步页屏幕显示 <b>BT: ADVERTISING</b>（表盘页无蓝牙，长按 OK → 3 TIME SYNC 进入同步页）；<br>
         ② 保持上方"仅显示名称过滤"<b>不勾选</b>——从全部设备列表里找。名字不是 CyberClock 的陌生设备也可能是它（macOS 会缓存旧的蓝牙广播名）；<br>
         ③ 系统设置 → 隐私与安全性 → 蓝牙：确认 <b>Chrome 已被允许</b>（首次弹窗点过"不允许"会静默失败）；<br>
         ④ 地址栏输入 <b>chrome://bluetooth-internals</b> → Devices → Start Scan：这里能扫到设备说明是选择器问题，扫不到则是系统蓝牙层面问题；<br>
@@ -384,7 +385,7 @@ async function writeTime(dateObj, tzHours) {
   $("btnWriteCustom").disabled = true;
   const { buf, ts } = buildPayload(dateObj, tzHours);
   const hintAutoOff = () =>
-    log("设备将在约 5 秒后自动断开并关闭蓝牙（v6 省电策略，正常现象）；再次同步请在设备上按 OK 键重开蓝牙", "info");
+    log("设备将在约 5 秒后自动进入表盘并关闭蓝牙（正常现象）；再次同步：设备长按 OK 键 → 菜单选 3 TIME SYNC，蓝牙自动重开", "info");
   try {
     await gattSerial(() => charWrite.writeValueWithResponse(buf));
     log(`已写入 FFC1：ts=${ts} tz=${tzHours}h`, "ok");
@@ -461,7 +462,7 @@ async function connect() {
       if (manualDisconnect) {
         log("已断开连接（手动）", "err");
       } else {
-        log("连接已断开（若刚同步成功，是设备约 5 秒后自动关蓝牙省电——属正常；再同步请在设备上按 OK 键重开蓝牙后重新连接）", "err");
+        log("连接已断开（若刚同步成功，是设备约 5 秒后自动进表盘关蓝牙——属正常；再同步：设备长按 OK → 3 TIME SYNC 后重新连接）", "err");
       }
       manualDisconnect = false;
       bleBusy = false;
@@ -501,7 +502,7 @@ async function connect() {
     }
   } catch (e) {
     if (e.name === "NotFoundError") {
-      log("未选择设备或列表为空：确认设备在时钟页面且屏幕显示 BT ADV（BT OFF 时在设备上按 OK 键开蓝牙；已同步的设备蓝牙默认关闭）、安卓已断开连接；Mac 用户建议改用 USB 标签页", "err");
+      log("未选择设备或列表为空：确认设备在 TIME SYNC 同步页且屏幕显示 BT: ADVERTISING（表盘页无蓝牙：长按 OK → 3 TIME SYNC）、安卓已断开连接；Mac 用户建议改用 USB 标签页", "err");
     } else {
       log(`连接失败：${e.name || ""} ${e.message}`, "err");
     }
