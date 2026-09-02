@@ -8,22 +8,22 @@
 
 支持 **BLE 蓝牙对时** 与 **USB 线对时** 双通道，蓝牙只属于时间同步页（表盘零射频功耗），无需配套 App——手机/Mac 浏览器网页或任意 BLE 调试工具即可完成时间同步。
 
-![固件](https://img.shields.io/badge/firmware-v8-00f0ff) ![芯片](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
+![固件](https://img.shields.io/badge/firmware-v9-00f0ff) ![芯片](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
 
-## 页面动线（v8）
+## 页面动线（v9）
 
 ```
-开机 → [TIME SYNC 时间同步页] --同步成功 5 秒后自动 / OK 跳过--> [表盘页]
-        （蓝牙仅此页开启）                              OK 长按 ↓
-                                                            [菜单页]
-                                                  1 表盘 | 2 亮度 | 3 时间同步
+开机 → [TIME SYNC 时间同步页] --按 OK 进表盘（蓝牙关闭）--> [表盘页]
+        （蓝牙仅此页开启，                          OK 长按 ↓
+         同步后停留本页）                               [菜单页]
+                                          1 表盘 | 2 亮度 | 3 时间同步
 ```
 
 ## 功能特性
 
 ### 赛博朋克时钟 UI（240×320）
 - HUD 风格布局：四角 L 形角标、侧边刻度线、分割线装饰
-- 大字号 `HH:MM` + 右侧独立秒数 `SS`
+- 大字号 `HH:MM` 带错位霓虹残影 + 右侧独立秒数 `SS` + 秒数垂直进度柱（v9）
 - 日期 + 星期 + 时区 + 运行时长
 - 底部电池条 + 百分比 + 电压，低电量红色告警
 - **4 套主题**：霓虹青紫 / 青绿单色 / 橙红暖色 / 矩阵绿
@@ -41,10 +41,10 @@
 - 文本命令协议：`PING` / `T <unix> <tz>` / `Q`
 - 浏览器直连（Chrome/Edge Web Serial）或 `usb-sync.py` 命令行脚本
 
-### 蓝牙只属于时间同步页（v8）
+### 蓝牙只属于时间同步页（v8/v9）
 - 进入 TIME SYNC 同步页（开机首屏）即开始广播，离开该页即关闭蓝牙——表盘页完全不碰射频
-- 同步页屏幕显示 `BT: ADVERTISING / BT: LINKED`，同步成功后显示自动跳表盘倒计时
-- **同步成功（蓝牙或 USB 均算）约 5 秒后自动进入表盘并关闭蓝牙**——留时间给对端收最终通知
+- 同步页屏幕显示 `BT: ADVERTISING / BT: LINKED`
+- **同步成功后设备停留在同步页**（v9：不自动跳转）——连接保持、网页可持续收到状态通知；按 OK 进表盘时蓝牙随之关闭
 - 需要再同步：长按 OK → 菜单 → `3 TIME SYNC`
 
 ### 亮度调整（v8）
@@ -55,11 +55,11 @@
 - 时间与时区持久化到 NVS，重启恢复粗略时间
 - LVGL 跨线程安全设计（BLE 回调仅置标志，UI 刷新全部在 LVGL 定时器上下文）
 
-## 按键操作（v8 按页面分发）
+## 按键操作（v9 按页面分发）
 
 | 页面 | 按键 | 动作 | 功能 |
 |---|---|---|---|
-| 时间同步页（开机首屏） | OK | 短按 | 跳过等待，直接进表盘 |
+| 时间同步页（开机首屏） | OK | 短按 | 进入表盘（同步后停留本页，不自动跳转） |
 | | OK | 长按 | 进入菜单 |
 | 表盘页 | UP | 短按 | 切换配色主题（蓝紫 → 青绿 → 橙红 → 矩阵绿） |
 | | DOWN | 短按 | 切换显示模式（完整 ⇄ 精简） |
@@ -72,7 +72,7 @@
 ## 快速开始
 
 ### 1. 刷固件
-预编译固件（v8）在 [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/)：
+预编译固件（v9）在 [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/)：
 - 浏览器刷写（免安装）：Chrome/Edge 打开官方刷机页——FoloToy [官方刷机页](https://ai-passport.folotoy.cn/tools/web-flasher/)（厂商首选）或 [esptool-js](https://espressif.github.io/esptool-js/)（芯片厂商通用版），连接设备后添加合并固件、地址填 `0x0` 即可——固件直链下载：<https://y2lin.github.io/AP_CyberClock/firmware/FoloToy-AI-Passport-full.bin>
 - 或 esptool：`esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
 

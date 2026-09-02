@@ -1,9 +1,10 @@
-// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v8 动线重构）
+// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v8 动线重构 / v9 微调）
 //
-// v8 页面动线（240x320 竖屏，三个实体按键）：
-//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启，USB/蓝牙任一同步成功
-//          后 5 秒自动进入表盘；OK 可立即跳过）
-//   PAGE_CLOCK（表盘页：纯显示，无蓝牙。UP=主题 DOWN=模式 OK长按=菜单）
+// v8/v9 页面动线（240x320 竖屏，三个实体按键）：
+//   开机 → PAGE_SYNC（时间同步页：BLE 只在本页开启；USB/蓝牙任一同步成功后
+//          停留本页实时显示状态——v9 起不再自动跳转，按 OK 手动进表盘）
+//   PAGE_CLOCK（表盘页：纯显示，无蓝牙。UP=主题 DOWN=模式 OK长按=菜单。
+//          v9 视觉优化：时间霓虹残影、秒数垂直进度柱、未同步图标闪烁）
 //   PAGE_MENU（菜单页：1 表盘 / 2 亮度 / 3 时间同步。UP/DOWN 选择，OK 进入，
 //          OK 长按回表盘）
 //   PAGE_BRIGHT（亮度页：UP/DOWN 以 10% 步进调整 10..100，NVS 持久化，
@@ -109,9 +110,6 @@ typedef enum {
 
 #define MENU_ITEM_COUNT 3
 
-// 同步成功后自动进表盘的延迟：给对端留出收最终 FFC2 通知 / 回读状态的时间
-#define SYNC_AUTO_EXIT_MS   5000
-
 // 亮度范围与步进
 #define BRIGHT_MIN   10
 #define BRIGHT_MAX   100
@@ -132,7 +130,10 @@ static lv_obj_t *s_pg[PAGE_COUNT_];       // 四个页面容器（互斥显示�
 
 // ---- 表盘页控件 ----
 static lv_obj_t *s_time_label;       // HH:MM 大号
+static lv_obj_t *s_time_shadow;      // 时间霓虹残影（主文字后方的偏移暗影）
 static lv_obj_t *s_sec_label;        // SS 小号
+static lv_obj_t *s_secbar_frame;     // 秒数垂直进度柱外框（v9）
+static lv_obj_t *s_secbar_fill;      // 秒数垂直进度柱填充（v9）
 static lv_obj_t *s_date_label;       // 日期
 static lv_obj_t *s_weekday_label;    // 星期
 static lv_obj_t *s_status_label;     // 同步状态+时区
@@ -190,8 +191,6 @@ static int s_batt_mv = 0;
 static int64_t s_enter_time;
 static bool s_ble_started = false;
 static volatile bool s_sync_pending;      // BLE 同步事件标志（跨任务传递）
-static uint32_t s_last_sync_count;        // 上次看到的同步计数（新同步事件边沿检测）
-static int64_t  s_auto_exit_ms = 0;       // >0：到点自动离开同步页进表盘
 
 // ============================================================================
 // 工具函数
@@ -367,6 +366,14 @@ static void build_clock_page(void)
     make_rect(parent, 224, 15, 2, 3, t->battery_ok);
 
     // ---- 时间区域 (y=50-170) ----
+    // 霓虹残影：先创建（垫底），主文字后创建覆盖其上——错位 3px 的暗色重影
+    s_time_shadow = lv_label_create(parent);
+    lv_obj_set_pos(s_time_shadow, 19, 63);
+    lv_label_set_text(s_time_shadow, "00:00");
+    lv_obj_set_style_text_font(s_time_shadow, &lv_font_montserrat_48, 0);
+    set_text_color(s_time_shadow, t->secondary);
+    lv_obj_set_style_text_opa(s_time_shadow, LV_OPA_20, 0);
+
     s_time_label = lv_label_create(parent);
     lv_obj_set_pos(s_time_label, 16, 60);
     lv_label_set_text(s_time_label, "00:00");
@@ -379,6 +386,13 @@ static void build_clock_page(void)
     lv_label_set_text(s_sec_label, "00");
     lv_obj_set_style_text_font(s_sec_label, &lv_font_montserrat_24, 0);
     set_text_color(s_sec_label, t->secondary);
+
+    // 秒数垂直进度柱（v9）：随秒数自下而上填充的发光柱
+    s_secbar_frame = make_rect(parent, 216, 66, 10, 52, t->primary);
+    lv_obj_set_style_bg_opa(s_secbar_frame, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_secbar_frame, 1, 0);
+    lv_obj_set_style_border_color(s_secbar_frame, lv_color_hex(t->hud_line), 0);
+    s_secbar_fill = make_rect(parent, 218, 68, 6, 48, t->secondary);
 
     // ---- 分割线 1 (y=182) ----
     s_divider1 = make_rect(parent, 20, 182, 200, 1, t->hud_line);
@@ -563,20 +577,13 @@ static void sync_page_update(void)
         }
     }
 
-    // 底部动作提示
-    if (s_auto_exit_ms > 0) {
-        int remain = (int)((s_auto_exit_ms - esp_timer_get_time() / 1000 + 999) / 1000);
-        if (remain < 0) remain = 0;
-        snprintf(buf, sizeof(buf), "AUTO EXIT %ds", remain);
-        set_text_color(s_sp_action, t->battery_ok);
-    } else if (st.synced) {
-        snprintf(buf, sizeof(buf), "OK: ENTER CLOCK");
-        set_text_color(s_sp_action, t->text_dim);
+    // 底部动作提示（v9：同步后停留本页，不自动跳转）
+    if (st.synced) {
+        lv_label_set_text(s_sp_action, "OK: ENTER CLOCK");
     } else {
-        snprintf(buf, sizeof(buf), "OK: SKIP TO CLOCK");
-        set_text_color(s_sp_action, t->text_dim);
+        lv_label_set_text(s_sp_action, "OK: SKIP TO CLOCK");
     }
-    lv_label_set_text(s_sp_action, buf);
+    set_text_color(s_sp_action, t->text_dim);
 }
 
 // ============================================================================
@@ -706,7 +713,10 @@ static void apply_theme(void)
 
     // ---- 表盘页 ----
     set_text_color(s_time_label, t->primary);
+    set_text_color(s_time_shadow, t->secondary);
     set_text_color(s_sec_label, t->secondary);
+    lv_obj_set_style_border_color(s_secbar_frame, lv_color_hex(t->hud_line), 0);
+    lv_obj_set_style_bg_color(s_secbar_fill, lv_color_hex(t->secondary), 0);
     set_text_color(s_weekday_label, t->primary);
     set_text_color(s_date_label, t->text_dim);
     set_text_color(s_sync_label, t->text_dim);
@@ -758,12 +768,13 @@ static void update_time_display(void)
     struct tm tm;
     localtime_r(&local, &tm);
 
-    // HH:MM
+    // HH:MM（含霓虹残影同步刷新）
     // 48 字节：容纳各格式理论最大值（含 "NOT SYNCED UTC%+d" 23 字节、
     // 日期最坏 35 字节），避免 -Werror=format-truncation 与实际截断。
     char buf[48];
     snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
     lv_label_set_text(s_time_label, buf);
+    lv_label_set_text(s_time_shadow, buf);
 
     // 未同步时时间主文字闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
     // 粗略旧值，不可信；闪烁提醒用户需要对时（USB 或同步页蓝牙任一方式）。
@@ -773,6 +784,15 @@ static void update_time_display(void)
     // SS
     snprintf(buf, sizeof(buf), "%02d", tm.tm_sec);
     lv_label_set_text(s_sec_label, buf);
+
+    // 秒数垂直进度柱：内高 48px，本分钟已过秒数自下而上填充（v9）
+    {
+        int bar_h = ((tm.tm_sec + 1) * 48) / 60;
+        if (bar_h < 0) bar_h = 0;
+        if (bar_h > 48) bar_h = 48;
+        lv_obj_set_height(s_secbar_fill, bar_h);
+        lv_obj_set_y(s_secbar_fill, 68 + (48 - bar_h));
+    }
 
     // 日期
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
@@ -790,11 +810,15 @@ static void update_time_display(void)
         lv_label_set_text(s_status_label, buf);
         set_text_color(s_status_label, t->primary);
         lv_obj_set_style_bg_color(s_sync_icon, lv_color_hex(t->battery_ok), 0);
+        lv_obj_set_style_bg_opa(s_sync_icon, LV_OPA_COVER, 0);
     } else {
         snprintf(buf, sizeof(buf), "NOT SYNCED  UTC%+d", tz_hours);
         lv_label_set_text(s_status_label, buf);
         set_text_color(s_status_label, t->warn);
         lv_obj_set_style_bg_color(s_sync_icon, lv_color_hex(t->warn), 0);
+        // 未同步时图标随秒闪烁（与时间文字同相位）
+        lv_obj_set_style_bg_opa(s_sync_icon,
+            (tm.tm_sec % 2) ? LV_OPA_40 : LV_OPA_COVER, 0);
     }
 
     // 运行时间（UP HH:MM）
@@ -820,7 +844,6 @@ static void page_switch(app_page_t next)
             ble_time_sync_stop();   // 同步操作：等 NimBLE host 真正退出
             s_ble_started = false;
         }
-        s_auto_exit_ms = 0;
     }
 
     s_page = next;
@@ -865,29 +888,11 @@ static void tick(lv_timer_t *timer)
         s_last_sec = -1;   // 强制立即刷新显示
     }
 
-    time_manager_state_t st = time_manager_get_state();
-    int64_t now_ms = esp_timer_get_time() / 1000;
-
-    // ---- 新同步事件边沿检测（BLE / USB 写时间都会让 sync_count 自增）----
-    // 只有在同步页才安排"5 秒后自动进表盘"（顺带关 BLE 省电）；
-    // 在其他页面收到同步事件（如表盘页 USB 对时）只刷新时间，不跳页面。
-    if (st.sync_count != s_last_sync_count) {
-        s_last_sync_count = st.sync_count;
-        if (s_page == PAGE_SYNC && s_auto_exit_ms == 0) {
-            s_auto_exit_ms = now_ms + SYNC_AUTO_EXIT_MS;
-            ESP_LOGI(TAG, "时间同步成功，%d 秒后自动进入表盘并关闭 BLE",
-                     SYNC_AUTO_EXIT_MS / 1000);
-        }
-    }
-
-    // ---- 到点自动离开同步页 ----
-    if (s_auto_exit_ms > 0 && now_ms >= s_auto_exit_ms) {
-        s_auto_exit_ms = 0;
-        page_switch(PAGE_CLOCK);   // 内部会停 BLE
-        return;
-    }
+    // v9：同步成功后不再自动跳转——同步页就是"对时工作台"，停留本页持续
+    // 显示 BT: LINKED 与 SYNCED 状态，由用户按 OK 手动进表盘（蓝牙随离页关闭）。
 
     // ---- 每秒刷新当前页面 ----
+    time_manager_state_t st = time_manager_get_state();
     time_t now = time_manager_get_unix_utc();
     time_t local = now + st.tz_offset;
     struct tm tm;
@@ -922,14 +927,13 @@ static void on_ble_sync(void)
 // ============================================================================
 void demo_cyber_clock_enter(void)
 {
-    ESP_LOGI(TAG, "进入赛博朋克时钟（v8 四页面动线）");
+    ESP_LOGI(TAG, "进入赛博朋克时钟（v9 四页面动线）");
     s_enter_time = esp_timer_get_time();
     s_last_sec = -1;
     s_batt_soc = -1;
     s_theme_idx = 0;
     s_mode = MODE_FULL;
     s_menu_sel = 0;
-    s_auto_exit_ms = 0;
     brightness_load();
 
     // 根屏幕 + 四个页面容器（互斥显示，切换即隐藏其余）
@@ -977,7 +981,6 @@ void demo_cyber_clock_exit(void)
         ble_time_sync_stop();
         s_ble_started = false;
     }
-    s_auto_exit_ms = 0;
     if (s_scr) {
         lv_obj_del(s_scr);
         s_scr = NULL;
@@ -985,7 +988,10 @@ void demo_cyber_clock_exit(void)
     memset(s_pg, 0, sizeof(s_pg));
 
     s_time_label = NULL;
+    s_time_shadow = NULL;
     s_sec_label = NULL;
+    s_secbar_frame = NULL;
+    s_secbar_fill = NULL;
     s_date_label = NULL;
     s_weekday_label = NULL;
     s_status_label = NULL;

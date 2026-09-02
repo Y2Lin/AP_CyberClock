@@ -60,6 +60,24 @@
     text-shadow: 0 0 8px rgba(0,240,255,0.5); box-shadow: 0 0 14px rgba(0,240,255,0.2);
   }
   .tab .rec { color: var(--ok); font-size: 11px; margin-left: 6px; }
+  /* 折叠说明区（默认收起，点击展开） */
+  details.fold { margin-top: 10px; }
+  details.fold summary {
+    cursor: pointer; user-select: none; list-style: none;
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; letter-spacing: 1px; color: var(--dim);
+    padding: 8px 12px; border: 1px dashed rgba(107,122,153,0.4); border-radius: 4px;
+    transition: color .15s, border-color .15s;
+  }
+  details.fold summary:hover { color: var(--cyan); border-color: var(--cyan); }
+  details.fold summary::-webkit-details-marker { display: none; }
+  details.fold summary::before { content: "▸"; color: var(--cyan); transition: transform .15s; }
+  details.fold[open] summary::before { transform: rotate(90deg); }
+  details.fold .fold-body {
+    margin-top: 8px; padding: 2px 12px;
+    border-left: 2px solid rgba(0,240,255,0.35);
+    font-size: 12.5px; line-height: 1.9; color: var(--dim);
+  }
   .card {
     background: var(--panel); border: 1px solid var(--border);
     padding: 18px 20px; margin-bottom: 16px; position: relative;
@@ -133,12 +151,12 @@
   <div id="banner"></div>
 
   <div class="tabs">
-    <button class="tab active" id="tabBle">蓝牙同步</button>
-    <button class="tab" id="tabUsb">USB 线同步 · 浏览器直连<span class="rec">推荐</span></button>
+    <button class="tab active" id="tabUsb">USB 线同步 · 浏览器直连<span class="rec">推荐</span></button>
+    <button class="tab" id="tabBle">蓝牙同步</button>
   </div>
 
-  <!-- ======================= 蓝牙面板 ======================= -->
-  <div id="panel-ble">
+  <!-- ======================= 蓝牙面板（备用通道） ======================= -->
+  <div id="panel-ble" class="hidden">
     <div class="card">
       <h2>连接设备（BLE）</h2>
       <div class="row">
@@ -150,23 +168,31 @@
         <label class="chk"><input type="checkbox" id="nameFilter">仅显示名称含 CyberClock 的设备</label>
       </div>
       <p class="note" style="margin-top:12px">
-        设备<b>开机即进入 TIME SYNC 时间同步页</b>（若已在表盘页：长按 OK 键 → 菜单选 <b>3 TIME SYNC</b>），
-        蓝牙自动开始广播，即可点击连接。<b>同步页屏幕中央显示蓝牙状态</b>：
-        <b>BT: ADVERTISING</b>=广播中（可直接连）、<b>BT: LINKED</b>=已连接。<br>
-        <b>v8 动线</b>：蓝牙仅在时间同步页开启（表盘页不耗蓝牙电）；
-        <b>同步成功约 5 秒后设备自动进入表盘并断开蓝牙</b>（正常现象，不是故障）。<br>
-        需要再次同步：设备上<b>长按 OK 键 → 3 TIME SYNC</b> 回到同步页，蓝牙自动重开。<br>
-        <b>Mac 找不到设备？最省事的办法：直接改用顶部“USB 线同步”标签页</b>（插线即可，不依赖蓝牙）。<br>
-        想继续走蓝牙，先做交叉验证（金标准）：Mac 设备选择框保持打开的同时，用安卓 nRF Connect
-        <b>只扫描不连接</b>——手机此刻能看到 CyberClock 而 Mac 看不到，说明设备广播正常、问题在 Mac 侧。然后按顺序排查：<br>
-        ① 确认安卓手机已<b>断开连接</b>（BLE 同一时间只允许一个中心设备连接，被占用时设备不广播）；
-        且设备同步页屏幕显示 <b>BT: ADVERTISING</b>（表盘页无蓝牙，长按 OK → 3 TIME SYNC 进入同步页）；<br>
-        ② 保持上方"仅显示名称过滤"<b>不勾选</b>——从全部设备列表里找。名字不是 CyberClock 的陌生设备也可能是它（macOS 会缓存旧的蓝牙广播名）；<br>
-        ③ 系统设置 → 隐私与安全性 → 蓝牙：确认 <b>Chrome 已被允许</b>（首次弹窗点过"不允许"会静默失败）；<br>
-        ④ 地址栏输入 <b>chrome://bluetooth-internals</b> → Devices → Start Scan：这里能扫到设备说明是选择器问题，扫不到则是系统蓝牙层面问题；<br>
-        ⑤ 系统设置 → 蓝牙 → 关闭再重新打开，重试；还不行就重启 Mac；<br>
-        ⑥ 都不行就改用 <b>USB 线同步</b>（见顶部标签页）或包内 <b>mac-sync.py</b> 脚本。
+        设备<b>开机即进入 TIME SYNC 同步页</b>（若在表盘页：长按 OK → 菜单选 <b>3 TIME SYNC</b>），
+        蓝牙自动广播，点击连接即可。屏幕显示 <b>BT: ADVERTISING</b>=可连接、<b>BT: LINKED</b>=已连接。
       </p>
+      <details class="fold">
+        <summary>连接须知（同步后设备行为 / 再同步方法）</summary>
+        <div class="fold-body">
+          蓝牙仅在时间同步页开启，表盘页不耗蓝牙电。<br>
+          同步成功后设备<b>停留在同步页</b>并持续显示最新状态（连接保持，可继续查看下方"设备状态"）；
+          在设备上<b>按 OK 键进入表盘</b>时蓝牙随之关闭（正常现象，不是故障）。<br>
+          需要再次同步：设备上<b>长按 OK 键 → 3 TIME SYNC</b> 回到同步页，蓝牙自动重开。
+        </div>
+      </details>
+      <details class="fold">
+        <summary>Mac / 浏览器搜不到设备？排查步骤</summary>
+        <div class="fold-body">
+          <b>最省事：直接用顶部"USB 线同步"标签页</b>（插线即可，不依赖蓝牙）。想继续走蓝牙，按顺序排查：<br>
+          ① 确认安卓手机已<b>断开连接</b>（BLE 同一时间只允许一个中心设备连接，被占用时设备不广播）；
+          且设备同步页屏幕显示 <b>BT: ADVERTISING</b>（表盘页无蓝牙，长按 OK → 3 TIME SYNC 进入同步页）；<br>
+          ② 保持上方"仅显示名称过滤"<b>不勾选</b>——从全部设备列表里找。名字不是 CyberClock 的陌生设备也可能是它（macOS 会缓存旧的蓝牙广播名）；<br>
+          ③ 系统设置 → 隐私与安全性 → 蓝牙：确认 <b>Chrome 已被允许</b>（首次弹窗点过"不允许"会静默失败）；<br>
+          ④ 地址栏输入 <b>chrome://bluetooth-internals</b> → Devices → Start Scan：这里能扫到设备说明是选择器问题，扫不到则是系统蓝牙层面问题；<br>
+          ⑤ 系统设置 → 蓝牙 → 关闭再重新打开，重试；还不行就重启 Mac；<br>
+          ⑥ 都不行就改用 <b>USB 线同步</b>（见顶部标签页）或包内 <b>mac-sync.py</b> 脚本。
+        </div>
+      </details>
     </div>
 
     <div class="card">
@@ -199,8 +225,8 @@
     </div>
   </div>
 
-  <!-- ======================= USB 面板 ======================= -->
-  <div id="panel-usb" class="hidden">
+  <!-- ======================= USB 面板（推荐，默认展示） ======================= -->
+  <div id="panel-usb">
     <div class="card">
       <h2>连接设备（USB Serial）</h2>
       <div class="row">
@@ -214,12 +240,19 @@
         <label class="chk"><input type="checkbox" id="usbNoVid">列表为空时：显示全部串口设备</label>
       </div>
       <p class="note" style="margin-top:12px">
-        用刷固件的 <b>同一条 USB 线</b>连接设备与电脑（必须是数据线），点击"连接 USB 设备"，
-        在弹窗里选择 <b>USB 串行设备（VID 303A）</b> 即可，全程不碰蓝牙。<br>
-        <b>固件要求 v5 及以上</b>（v4 及更早没有 USB 对时命令，PING 无响应时请先升级固件）。<br>
-        浏览器占用串口期间 <b>无法烧录固件</b>（esptool 打不开端口），烧录前先点"断开"。<br>
-        Windows 若弹窗为空：需要安装 <a href="https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers" target="_blank" style="color:var(--cyan)">CP210x 驱动</a> 的板子另说；本设备是 ESP32-C3 原生 USB（Win10/11 免驱），列表为空多为线是充电线。
+        用刷固件的 <b>同一条 USB 数据线</b>连接设备，点击"连接 USB 设备"，
+        选 <b>USB 串行设备（VID 303A）</b> 即可，全程不碰蓝牙。
       </p>
+      <details class="fold">
+        <summary>常见问题（驱动 / 烧录互斥 / 列表为空）</summary>
+        <div class="fold-body">
+          <b>固件要求 v5 及以上</b>（v4 及更早没有 USB 对时命令，PING 无响应时请先升级固件）。<br>
+          浏览器占用串口期间 <b>无法烧录固件</b>（esptool 打不开端口），烧录前先点"断开"。<br>
+          打开串口瞬间设备可能复位一次，属正常现象，页面会自动重试 PING。<br>
+          Windows 弹窗为空：本设备是 ESP32-C3 原生 USB（Win10/11 免驱），列表为空多为线是充电线；
+          其他板子才需要 <a href="https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers" target="_blank" style="color:var(--cyan)">CP210x 驱动</a>。
+        </div>
+      </details>
     </div>
 
     <div class="card">
@@ -384,23 +417,23 @@ async function writeTime(dateObj, tzHours) {
   $("btnSyncNow").disabled = true;
   $("btnWriteCustom").disabled = true;
   const { buf, ts } = buildPayload(dateObj, tzHours);
-  const hintAutoOff = () =>
-    log("设备将在约 5 秒后自动进入表盘并关闭蓝牙（正常现象）；再次同步：设备长按 OK 键 → 菜单选 3 TIME SYNC，蓝牙自动重开", "info");
+  const hintAfterSync = () =>
+    log("时间已写入。设备停留在同步页且连接保持——可继续查看下方状态；在设备上按 OK 键进入表盘（蓝牙随之关闭），或点上方“断开”", "info");
   try {
     await gattSerial(() => charWrite.writeValueWithResponse(buf));
     log(`已写入 FFC1：ts=${ts} tz=${tzHours}h`, "ok");
-    hintAutoOff();
+    hintAfterSync();
     return true;
   } catch (e) {
     // already-in-progress 说明有操作占线（不该发生，队列已串行化）；断开类错误不重试
     const disconnected = /disconnect/i.test(e.message || "");
     if (disconnected) {
-      log(`写入失败：连接已断开（若刚同步成功，是设备 5 秒后自动关蓝牙——属正常）；重新连接即可`, "err");
+      log(`写入失败：连接已断开（设备端蓝牙随同步页开启，可重新连接）`, "err");
     } else {
       try {
         await gattSerial(() => charWrite.writeValueWithoutResponse(buf));
         log(`已写入 FFC1（无响应模式）：ts=${ts} tz=${tzHours}h`, "ok");
-        hintAutoOff();
+        hintAfterSync();
         return true;
       } catch (e2) {
         log(`写入失败：${esc(e2.message)}`, "err");
@@ -432,7 +465,7 @@ function onNotify(e) {
   }
 }
 
-let manualDisconnect = false;   // 区分用户主动断开与设备自动断开（v6 省电）
+let manualDisconnect = false;   // 区分用户主动断开与其他原因断开
 
 async function connect() {
   if (!navigator.bluetooth) {
@@ -462,7 +495,7 @@ async function connect() {
       if (manualDisconnect) {
         log("已断开连接（手动）", "err");
       } else {
-        log("连接已断开（若刚同步成功，是设备约 5 秒后自动进表盘关蓝牙——属正常；再同步：设备长按 OK → 3 TIME SYNC 后重新连接）", "err");
+        log("连接已断开（设备端蓝牙随同步页保持开启，可重新连接；在设备上按 OK 进表盘则蓝牙关闭，需回同步页再连）", "err");
       }
       manualDisconnect = false;
       bleBusy = false;

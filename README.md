@@ -8,15 +8,15 @@ A **cyberpunk-style clock** firmware for the FoloToy AI Passport (ESP32-C3), bui
 
 Supports **BLE** and **USB cable** time sync, with a dedicated time-sync page owning all Bluetooth activity (the clock face stays radio-free). No companion app required — a browser page or any BLE debug tool is enough.
 
-![firmware](https://img.shields.io/badge/firmware-v8-00f0ff) ![chip](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
+![firmware](https://img.shields.io/badge/firmware-v9-00f0ff) ![chip](https://img.shields.io/badge/chip-ESP32--C3-ff2ec4) ![license](https://img.shields.io/badge/license-MIT-green)
 
-## Navigation (v8)
+## Navigation (v9)
 
 ```
-boot -> [TIME SYNC page]  --synced: auto after 5 s / OK: skip-->  [Clock face]
-        (BLE only here)                                        OK long |
-                                                               v
-                                                             [Menu]
+boot -> [TIME SYNC page]  --OK: go to clock (BT turns off)-->  [Clock face]
+        (BLE only here;                                      OK long |
+         stays after sync)                                          v
+                                                                 [Menu]
                                                    1 Clock | 2 Brightness | 3 Time Sync
 ```
 
@@ -24,7 +24,7 @@ boot -> [TIME SYNC page]  --synced: auto after 5 s / OK: skip-->  [Clock face]
 
 ### Cyberpunk clock UI (240x320)
 - HUD-style layout: corner brackets, side tick marks, divider lines
-- Large `HH:MM` digits with a separate `SS` seconds field
+- Large `HH:MM` digits with an offset neon shadow + separate `SS` field and a vertical seconds progress bar (v9)
 - Date + weekday + timezone + uptime
 - Battery bar + percentage + voltage, low-battery warning in red
 - **4 themes**: neon cyan-purple / teal / amber / matrix green
@@ -42,10 +42,10 @@ boot -> [TIME SYNC page]  --synced: auto after 5 s / OK: skip-->  [Clock face]
 - Text command protocol: `PING` / `T <unix> <tz>` / `Q`
 - Browser direct connect (Chrome/Edge Web Serial) or `usb-sync.py`
 
-### Bluetooth lives on the sync page (v8)
+### Bluetooth lives on the sync page (v8/v9)
 - Entering the TIME SYNC page (boot first screen) starts advertising; leaving it stops Bluetooth entirely — the clock face never touches the radio
-- The sync page shows `BT: ADVERTISING / BT: LINKED` and a countdown after a successful sync
-- **~5 s after a successful sync (BLE or USB), the device jumps to the clock face and Bluetooth turns itself off** — time for the peer to receive the final notification
+- The sync page shows `BT: ADVERTISING / BT: LINKED`
+- **After a successful sync the device stays on the sync page** (v9: no auto-jump) — the connection is kept so the web page keeps receiving status; pressing OK goes to the clock face and Bluetooth turns off
 - Re-sync any time: long-press OK -> menu -> `3 TIME SYNC`
 
 ### Brightness (v8)
@@ -56,11 +56,11 @@ boot -> [TIME SYNC page]  --synced: auto after 5 s / OK: skip-->  [Clock face]
 - Time and timezone persisted to NVS, restored on boot (coarse)
 - LVGL thread safety: callbacks only set flags; UI refresh happens in the LVGL timer context
 
-## Keys (per page, v8)
+## Keys (per page, v9)
 
 | Page | Key | Action | Function |
 |---|---|---|---|
-| TIME SYNC (boot) | OK | short | Skip waiting, go to clock face |
+| TIME SYNC (boot) | OK | short | Go to clock face (page stays after sync, no auto-jump) |
 | | OK | long | Menu |
 | Clock face | UP | short | Cycle theme (neon cyan-purple -> teal -> amber -> matrix green) |
 | | DOWN | short | Toggle display mode (full <-> minimal) |
@@ -73,7 +73,7 @@ boot -> [TIME SYNC page]  --synced: auto after 5 s / OK: skip-->  [Clock face]
 ## Quick start
 
 ### 1. Flash the firmware
-Prebuilt binaries (v8) live in [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/):
+Prebuilt binaries (v9) live in [`tools/cyber-clock-sync/firmware/`](tools/cyber-clock-sync/firmware/):
 - Browser flash (no install): open the official flasher page — FoloToy's [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/) (vendor) or [esptool-js](https://espressif.github.io/esptool-js/) (Espressif) — in Chrome/Edge, connect the device, add the merged firmware with offset `0x0` and flash — direct download link: <https://y2lin.github.io/AP_CyberClock/firmware/FoloToy-AI-Passport-full.bin>
 - Or esptool: `esptool --chip esp32c3 write_flash 0x0 FoloToy-AI-Passport-full.bin`
 
