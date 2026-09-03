@@ -55,7 +55,7 @@ static bool s_started;
 #define SHOT_SLOTS      3
 #define SHOT_SLOT_BYTES ((size_t)SHOT_SLOT_W * SHOT_SLOT_ROWS * 2)   // 11520
 #define SHOT_RING_BYTES (SHOT_SLOT_BYTES * SHOT_SLOTS)               // 34560
-#define SHOT_USB_PIECE  2048                               // 单次 USB 写入上限
+#define SHOT_USB_PIECE  1024                               // 单次 USB 写入上限（见下）
 
 static volatile bool s_shot_req;          // USB 任务 -> service：请求截屏
 static volatile int  s_shot_state;        // 见上方状态机
@@ -143,13 +143,36 @@ void usb_time_sync_snapshot_service(void)
     lv_obj_invalidate(lv_screen_active());
 }
 
-// USB 任务侧：请求 → 打印头 → 排空环形槽。成功返回 true。
-static bool shot_stream(void)
+// USB 任务侧：请求 → 打印头 → 排空环形槽。返回 0 成功，否则为原因码。
+// 原因码经 handle_line 打成 "ERR SHOT <原因>"，真机诊断不用猜。
+#define SHOT_ERR_BUSY   1     // 上一单未结束
+#define SHOT_ERR_MEM    2     // 环形缓冲分配失败
+#define SHOT_ERR_HOOK   3     // service() 未在 3s 内挂钩
+#define SHOT_ERR_DATA   4     // 挂钩后 3s 无首块数据
+#define SHOT_ERR_STALL  5     // 流式中 3s 无新块
+#define SHOT_ERR_USB    6     // USB 写入失败（主机断开等）
+#define SHOT_ERR_SHORT  7     // 发送量不足/状态异常
+
+static const char *shot_err_str(int code)
 {
-    if (s_shot_state == 1 || s_shot_state == 2) return false;   // 上一单未结束
+    switch (code) {
+    case SHOT_ERR_BUSY:  return " BUSY";
+    case SHOT_ERR_MEM:   return " MEM";
+    case SHOT_ERR_HOOK:  return " HOOK";
+    case SHOT_ERR_DATA:  return " DATA";
+    case SHOT_ERR_STALL: return " STALL";
+    case SHOT_ERR_USB:   return " USB";
+    case SHOT_ERR_SHORT: return " SHORT";
+    default:             return "";
+    }
+}
+
+static int shot_stream(void)
+{
+    if (s_shot_state == 1 || s_shot_state == 2) return SHOT_ERR_BUSY;
 
     uint8_t *ring = malloc(SHOT_RING_BYTES);                    // 34.5KB，一次成功
-    if (!ring) { s_shot_state = 4; return false; }
+    if (!ring) { s_shot_state = 4; return SHOT_ERR_MEM; }
     s_shot_ring = ring;
     for (int i = 0; i < SHOT_SLOTS; i++) { s_slot_filled[i] = false; s_slot_len[i] = 0; }
     s_widx = s_ridx = 0;
@@ -169,7 +192,7 @@ static bool shot_stream(void)
         int w = s_shot_w, h = s_shot_h;
         size_t expected = (size_t)w * h * 2;
         size_t sent = 0;
-        bool ok = true;
+        int rc = 0;
 
         // 先全局静默日志再打印头，保证头与像素流之间不混入控制台字节
         esp_log_level_set("*", ESP_LOG_NONE);
@@ -180,46 +203,52 @@ static bool shot_stream(void)
             int slot = s_ridx % SHOT_SLOTS;
             int t = 0;
             while (!s_slot_filled[slot]) {
-                if (s_shot_state == 4 || s_shot_state == 0) { ok = false; break; }
-                if (s_shot_state == 3 && s_ridx >= s_widx) { ok = false; break; }
-                if (++t > 300) { ok = false; break; }            // 3s 无新块
+                if (s_shot_state == 4 || s_shot_state == 0) { rc = SHOT_ERR_SHORT; break; }
+                if (s_shot_state == 3 && s_ridx >= s_widx) { rc = SHOT_ERR_SHORT; break; }
+                if (++t > 300) { rc = SHOT_ERR_STALL; break; }   // 3s 无新块
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-            if (!ok) break;
+            if (rc) break;
+            // 注意：usb_serial_jtag_write_bytes 底层是 FreeRTOS ringbuffer，
+            // 单条数据必须连续放进 TX 环——驱动默认 TX 环仅 256B，因此
+            // ① 启动时把 TX 环扩到 4KB（见 usb_time_sync_start）
+            // ② 这里按 1KB 分段发送，确保条目总能放下
             const uint8_t *p = ring + (size_t)slot * SHOT_SLOT_BYTES;
             size_t left = (size_t)s_slot_len[slot];
             while (left > 0) {
                 size_t piece = left > SHOT_USB_PIECE ? SHOT_USB_PIECE : left;
                 int n = usb_serial_jtag_write_bytes(p, piece, pdMS_TO_TICKS(1000));
-                if (n <= 0) { ok = false; break; }               // 主机断开等
+                if (n <= 0) { rc = SHOT_ERR_USB; break; }        // 主机断开等
                 p += n; left -= (size_t)n; sent += (size_t)n;
             }
             s_slot_filled[slot] = false;                         // 归还生产者
             s_ridx++;
-            if (!ok) break;
+            if (rc) break;
         }
         esp_log_level_set("*", ESP_LOG_INFO);
-        if (!ok) s_shot_abort = true;
+        if (rc) s_shot_abort = true;
         // 等渲染侧摘钩（正常在最后一格产出时就已摘掉）
         for (int t = 0; t < 150 && s_shot_hooked; t += 10)
             vTaskDelay(pdMS_TO_TICKS(10));
         free(ring);
         s_shot_ring = NULL;
-        bool success = ok && sent == expected && s_shot_state == 3;
+        bool success = (rc == 0) && sent == expected && s_shot_state == 3;
         s_shot_state = 0;
         s_shot_abort = false;
-        return success;
+        return success ? 0 : (rc ? rc : SHOT_ERR_SHORT);
     }
 
-fail:
-    s_shot_abort = true;
-    for (int t = 0; t < 150 && s_shot_hooked; t += 10)
-        vTaskDelay(pdMS_TO_TICKS(10));
-    free(ring);
-    s_shot_ring = NULL;
-    s_shot_state = 0;
-    s_shot_abort = false;
-    return false;
+fail: {
+        int why = (s_shot_state == 1) ? SHOT_ERR_DATA : SHOT_ERR_HOOK;   // 记录时状态尚未复位
+        s_shot_abort = true;
+        for (int t = 0; t < 150 && s_shot_hooked; t += 10)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        free(ring);
+        s_shot_ring = NULL;
+        s_shot_state = 0;
+        s_shot_abort = false;
+        return why;
+    }
 }
 
 static void handle_line(const char *line)
@@ -233,7 +262,8 @@ static void handle_line(const char *line)
     // ---- FAP_SCREENSHOT_V1：返回运行中的屏幕画面（纯观测，不改任何状态）----
     if (strncmp(buf, "FAP_SCREENSHOT_V1", 17) == 0 &&
         (buf[17] == '\0' || buf[17] == ' ')) {
-        if (!shot_stream()) printf("ERR SHOT\n");
+        int rc = shot_stream();
+        if (rc) printf("ERR SHOT%s\n", shot_err_str(rc));
         return;
     }
 
@@ -316,8 +346,14 @@ esp_err_t usb_time_sync_start(void)
 {
     if (s_started) return ESP_OK;
 
-    // 安装 USB Serial/JTAG 驱动(已装则复用),控制台输出切换到驱动路径
-    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    // 安装 USB Serial/JTAG 驱动(已装则复用),控制台输出切换到驱动路径。
+    // TX 环从默认 256B 扩到 4KB：FAP_SCREENSHOT_V1 的二进制流以 1KB 条目
+    // 写入，驱动底层是 FreeRTOS ringbuffer（条目需连续放入），256B 的环
+    // 连一条都放不下，写必失败（v10.4.1 真机 ERR SHOT USB 的根因）。
+    usb_serial_jtag_driver_config_t cfg = {
+        .tx_buffer_size = 4096,
+        .rx_buffer_size = 256,
+    };
     esp_err_t err = usb_serial_jtag_driver_install(&cfg);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "usb_serial_jtag 驱动安装失败: %s", esp_err_to_name(err));
