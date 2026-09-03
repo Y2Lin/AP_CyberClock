@@ -20,6 +20,7 @@
 
 ## 现有文档索引
 
+- [cyber-clock-design.zh_CN.md](cyber-clock-design.zh_CN.md)：赛博朋克时钟应用栈设计——模块划分、并发模型、页面状态机、时间同步数据流、持久化布局、显示预算与失败降级（固件 v10.1+）。
 - [AGENTS.md](../../AGENTS.md)：仓库权威 AI 规范的入口与索引。
 
 > 注：`docs/software-design` 用于容纳软件设计文档。协作规范见 `docs/contribution/`，工程规范和 CI 说明见 `docs/development/`，fork 工作流见 `docs/fork-guide.md`；这些入口均由 `AGENTS.md` 索引。
