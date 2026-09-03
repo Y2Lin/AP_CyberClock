@@ -78,8 +78,9 @@ Flash-wear note: 5-minute cadence is 288 writes/day; unsynced time is never writ
 
 ## Known limitations and tradeoffs
 
-- The upstream demo menu in `main.c` is unreachable since v8 (direct app entry) and awaits cleanup.
-- NVS persistence currently executes inside the BLE write callback (host task) and the USB task; moving it to the timer context is a known follow-up.
-- BLE timezone writes are not range-checked yet (USB path is, ±14 h).
-- A failed `ble_time_sync_stop()` can leave the service marked initialized, disabling BLE until reboot.
 - E-ink theme disables ghosting and glitch effects by design; minimal mode hides decorative streams.
+- Battery I2C reads every 5 s run in the LVGL timer context (tens of ms, accepted and documented tradeoff).
+- Leaving the sync page stops Bluetooth synchronously under the LVGL lock (a deliberate one-off stall instead of a cross-task teardown state machine).
+- The persisted state blob has no version field; a future struct change falls back to defaults rather than migrating.
+
+The following limitations from v10.1 were resolved in v10.3: the unreachable demo menu was removed (unreferenced demo pages and the Wi-Fi stack they pulled in are linker-pruned), NVS persistence moved out of the BLE/USB callbacks into the timer context, timezone writes gained a ±14-hour final guard, and a failed Bluetooth stop no longer leaves the service permanently disabled.

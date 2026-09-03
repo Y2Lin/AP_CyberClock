@@ -33,21 +33,14 @@ struct tm time_manager_get_local(void);
 // 获取当前 UTC Unix 时间戳（秒）。
 time_t time_manager_get_unix_utc(void);
 
-// 运行期间定期把当前时间回写 NVS，缩小断电后恢复值的偏差。
-// 可放心每秒调用：内部按 5 分钟节流；未同步时直接返回，不产生 flash 写入。
-void time_manager_periodic_save(void);
+// 运行期间把待写状态落盘（消费 set_* 置位的 dirty 标志），并按 5 分钟
+// 节流回写当前时间，缩小断电后恢复值的偏差。
+// 建议每秒调用一次（LVGL 定时器上下文）：NVS 写入全部收敛到这里，
+// BLE/USB 任务只更新内存态；未同步且无待写时直接返回，不产生 flash 写入。
+void time_manager_flush_pending(void);
 
-// 获取当前状态的只读快照。
+// 获取当前状态的只读快照（临界区内拷贝，多字段不会撕裂）。
 time_manager_state_t time_manager_get_state(void);
 
 // 判断时间是否可信（已同步过且距上次同步不超过 max_age_seconds）。
 bool time_manager_is_reliable(uint32_t max_age_seconds);
-
-// 格式化本地时间为 "HH:MM:SS"，写入 buf（至少 9 字节）。
-void time_manager_format_hms(char *buf, size_t buf_size);
-
-// 格式化本地日期为 "YYYY-MM-DD"，写入 buf（至少 11 字节）。
-void time_manager_format_ymd(char *buf, size_t buf_size);
-
-// 格式化星期为英文缩写 "MON".."SUN"，写入 buf（至少 4 字节）。
-void time_manager_format_weekday(char *buf, size_t buf_size);

@@ -6,6 +6,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"   // portMUX（状态快照临界区）
 #include <string.h>
 #include <sys/time.h>
 
@@ -16,11 +17,39 @@ static const char *TAG = "time_mgr";
 #define NVS_KEY_TZ     "tz_offset"
 #define NVS_KEY_LAST   "last_unix"
 
+// 视为合法的时间戳下限：2023-11-14，防止 NVS 脏数据把时钟拨回 1970 附近
+#define TIME_MIN_VALID_UNIX 1700000000LL
+
+// 时区偏移的最终防线：UTC-14 .. UTC+14。
+// USB 入口自带 ±14 校验；BLE 入口此前完全没有校验（int16 全范围可写穿，
+// 屏幕会显示公元前后），v10.3 起在这里统一拦截。
+#define TZ_MIN_SECONDS (-14 * 3600)
+#define TZ_MAX_SECONDS ( 14 * 3600)
+
 static time_manager_state_t s_state;
 static bool s_initialized;
 
-// 把状态写入 NVS。失败只打日志，不阻塞 UI。
-static void persist_state(void)
+// ---- 延迟持久化（v10.3，对应审查 P3-2）----
+// set_unix_utc / set_timezone 可能运行在 NimBLE host 任务或 USB 任务里，
+// 旧版直接在这些回调里 nvs_commit：flash 擦除可达上百毫秒，会把协议栈
+// 任务卡住——与 v4 确立的"回调只置标志"原则相悖（当时只对 LVGL 成立）。
+// 现在 NVS 写入统一挪到 LVGL 定时器上下文：
+//   - set_* 只更新内存态并置 dirty 标志（volatile；调用方即生产者）
+//   - flush_pending() 每秒被调用一次（cyber_clock tick），有 dirty 才写
+// 掉电窗口：同步后 1 秒内断电会丢这次记录——重启后本就要重新对时，可接受。
+static volatile bool s_dirty_state;   // state blob 待写
+static volatile bool s_dirty_tz;      // tz_offset 键待写
+static volatile bool s_dirty_last;    // last_unix 键待写
+
+// ---- 状态快照的并发保护（v10.3，对应审查 P3-5）----
+// s_state 有两个写任务（BLE host / USB）与一个读任务（LVGL 定时器按值
+// 拷贝整个结构体）。RV32 上单个对齐字段读写原子，但多字段快照可能撕裂
+// 出半新半旧的组合。写路径与 get_state() 都包在极短临界区内，彻底杜绝。
+static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// 立即写 state blob。仅限进程级上下文（init 的开机清除路径）使用；
+// 运行期一律走 dirty 标志 + flush_pending()。
+static void persist_state_now(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
@@ -46,7 +75,13 @@ esp_err_t time_manager_init(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
         size_t len = sizeof(s_state);
-        nvs_get_blob(h, NVS_KEY_STATE, &s_state, &len);
+        // 返回值检查（v10.3）：首次开机 blob 不存在属正常路径，只打调试日志；
+        // 未来若扩展 state 结构导致长度不符，这里同样静默回落默认值。
+        esp_err_t bl = nvs_get_blob(h, NVS_KEY_STATE, &s_state, &len);
+        if (bl != ESP_OK) {
+            ESP_LOGD(TAG, "state blob 未读取（首次开机或结构变更）: %s",
+                     esp_err_to_name(bl));
+        }
         int32_t tz = 0;
         if (nvs_get_i32(h, NVS_KEY_TZ, &tz) == ESP_OK && tz != 0) {
             s_state.tz_offset = tz;
@@ -55,7 +90,8 @@ esp_err_t time_manager_init(void)
         // 注意：深度睡眠期间 RTC 定时器仍在跑，但系统时间会重置，
         // 所以这里恢复的值仅用于"未同步时显示一个大概时间"。
         int64_t last_unix = 0;
-        if (nvs_get_i64(h, NVS_KEY_LAST, &last_unix) == ESP_OK && last_unix > 1700000000) {
+        if (nvs_get_i64(h, NVS_KEY_LAST, &last_unix) == ESP_OK &&
+            last_unix > TIME_MIN_VALID_UNIX) {
             struct timeval tv = { .tv_sec = (time_t)last_unix, .tv_usec = 0 };
             settimeofday(&tv, NULL);
             ESP_LOGI(TAG, "从 NVS 恢复粗略时间: %lld", (long long)last_unix);
@@ -72,7 +108,7 @@ esp_err_t time_manager_init(void)
     //
     // 旧实现靠 "last_sync_ms > esp_timer_get_time()" 判断单调钟是否回退来识别重启；
     // 这条判据依赖 esp_timer 在复位后归零，在部分唤醒路径下并不成立，
-    // 于是界面继续显示 SYNCED 而时间其实是错的 —— 正是本次要修的现象。
+    // 于是界面继续显示 SYNCED 而时间其实是错的 —— v10.1 修掉的现象。
     // 只清 synced，sync_count 是历史统计，保留。
     if (s_state.synced) {
         ESP_LOGI(TAG, "复位源=%d esp_timer=%lldms：恢复的时间不可信，"
@@ -80,7 +116,7 @@ esp_err_t time_manager_init(void)
                  (int)esp_reset_reason(),
                  (long long)(esp_timer_get_time() / 1000));
         s_state.synced = false;
-        persist_state();
+        persist_state_now();
     }
 
     s_initialized = true;
@@ -100,18 +136,15 @@ esp_err_t time_manager_set_unix_utc(time_t unix_seconds)
         return ESP_FAIL;
     }
 
+    // 只更新内存态（临界区内仅字段赋值），NVS 写入交给 flush_pending()
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&s_state_mux);
     s_state.synced = true;
     s_state.sync_count++;
-    s_state.last_sync_ms = esp_timer_get_time() / 1000;
-
-    // 持久化：状态 + 当前时间（供下次启动粗略恢复）。
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_blob(h, NVS_KEY_STATE, &s_state, sizeof(s_state));
-        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)unix_seconds);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    s_state.last_sync_ms = now_ms;
+    portEXIT_CRITICAL(&s_state_mux);
+    s_dirty_state = true;
+    s_dirty_last = true;   // last_unix 也要尽快落盘，不能等 5 分钟节流
 
     ESP_LOGI(TAG, "时间已同步: UTC=%lld, 本地同步次数=%u",
              (long long)unix_seconds, s_state.sync_count);
@@ -121,15 +154,18 @@ esp_err_t time_manager_set_unix_utc(time_t unix_seconds)
 esp_err_t time_manager_set_timezone(int32_t offset_seconds)
 {
     if (!s_initialized) time_manager_init();
-    s_state.tz_offset = offset_seconds;
-    persist_state();
-
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, NVS_KEY_TZ, offset_seconds);
-        nvs_commit(h);
-        nvs_close(h);
+    // 范围校验（v10.3，P3-3）：BLE 入口此前无任何校验；这里是最终防线
+    if (offset_seconds < TZ_MIN_SECONDS || offset_seconds > TZ_MAX_SECONDS) {
+        ESP_LOGW(TAG, "时区偏移越界被拒绝: %ld 秒（允许 %d..%d）",
+                 (long)offset_seconds, TZ_MIN_SECONDS, TZ_MAX_SECONDS);
+        return ESP_ERR_INVALID_ARG;
     }
+    portENTER_CRITICAL(&s_state_mux);
+    s_state.tz_offset = offset_seconds;
+    portEXIT_CRITICAL(&s_state_mux);
+    // 只写 tz 键即可：读路径 blob 先读、tz 键覆盖，blob 里的旧值不会生效
+    // （v10.3，P4-7：旧版 blob + 键双写同一信息属冗余）
+    s_dirty_tz = true;
     return ESP_OK;
 }
 
@@ -148,63 +184,64 @@ struct tm time_manager_get_local(void)
     return tm;
 }
 
-// 运行期间定期把当前时间回写 NVS（建议每秒调用一次，内部自行节流）。
+// 运行期间定期把待写状态与当前时间落盘（建议每秒调用一次，内部自行节流）。
 //
-// NVS_KEY_LAST 过去只在 set_unix_utc() 里写一次，后果是：连续开机 N 小时后断电，
-// 下次启动恢复出来的时间整整慢 N 小时 —— 这是"关机再打开时间就不对了"的主要放大项。
-// 按 5 分钟节奏回写后，断电恢复值的偏差被压到 5 分钟以内。
-// 不做每分钟是为了控制 flash 擦写次数：NVS 有磨损均衡，但每天 288 次比 1440 次稳妥得多。
-void time_manager_periodic_save(void)
+// 职责（v10.3 起合并了旧 periodic_save）：
+//   1. 把 set_unix_utc / set_timezone 置位的 dirty 标志消费掉——NVS 写入
+//      从 BLE/USB 任务上下文挪到了这里（LVGL 定时器，已持锁）；
+//   2. 每 5 分钟回写一次 last_unix：旧版只在同步瞬间写一次，开机 N 小时后
+//      断电，恢复值慢 N 小时；回写后偏差被压到 5 分钟以内。
+//      不做每分钟是为了控制 flash 擦写：每天 288 次比 1440 次稳妥得多。
+void time_manager_flush_pending(void)
 {
-    if (!s_state.synced) return;   // 未同步时时间本就不可信，不值得写
+    if (!s_initialized) return;
 
+    // 摘下 dirty 位（本函数只在 LVGL 定时器上下文被调，单消费者）
+    bool d_state = s_dirty_state; s_dirty_state = false;
+    bool d_tz    = s_dirty_tz;    s_dirty_tz    = false;
+    bool d_last  = s_dirty_last;  s_dirty_last  = false;
+
+    // 5 分钟节流的 last_unix 回写（仅同步状态下才有意义）
     struct tm tm = time_manager_get_local();
-    if (tm.tm_sec != 0 || tm.tm_min % 5 != 0) return;
-
+    bool periodic = s_state.synced && tm.tm_sec == 0 && tm.tm_min % 5 == 0;
     static int last_min = -1;
-    if (tm.tm_min == last_min) return;   // 同一分钟内不重复写
-    last_min = tm.tm_min;
+    if (periodic && tm.tm_min == last_min) periodic = false;  // 同分钟不重写
+    else if (periodic) last_min = tm.tm_min;
+
+    if (!d_state && !d_tz && !d_last && !periodic) return;
 
     nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)time_manager_get_unix_utc());
-        nvs_commit(h);
-        nvs_close(h);
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        // 打开失败：dirty 放回去，下一秒重试（时间戳类不重试，等下个节流点）
+        if (d_state) s_dirty_state = true;
+        if (d_tz)    s_dirty_tz    = true;
+        if (d_last)  s_dirty_last  = true;
+        return;
     }
+    if (d_state)
+        nvs_set_blob(h, NVS_KEY_STATE, &s_state, sizeof(s_state));
+    if (d_tz)
+        nvs_set_i32(h, NVS_KEY_TZ, s_state.tz_offset);
+    if (d_last || periodic)
+        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)time_manager_get_unix_utc());
+    nvs_commit(h);
+    nvs_close(h);
 }
 
 time_manager_state_t time_manager_get_state(void)
 {
-    return s_state;
+    time_manager_state_t snap;
+    portENTER_CRITICAL(&s_state_mux);
+    snap = s_state;
+    portEXIT_CRITICAL(&s_state_mux);
+    return snap;
 }
 
 bool time_manager_is_reliable(uint32_t max_age_seconds)
 {
-    if (!s_state.synced) return false;
+    time_manager_state_t st = time_manager_get_state();
+    if (!st.synced) return false;
     int64_t now_ms = esp_timer_get_time() / 1000;
-    int64_t elapsed = (now_ms - s_state.last_sync_ms) / 1000;
+    int64_t elapsed = (now_ms - st.last_sync_ms) / 1000;
     return elapsed >= 0 && (uint32_t)elapsed <= max_age_seconds;
-}
-
-void time_manager_format_hms(char *buf, size_t buf_size)
-{
-    if (!buf || buf_size < 9) return;
-    struct tm tm = time_manager_get_local();
-    snprintf(buf, buf_size, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
-}
-
-void time_manager_format_ymd(char *buf, size_t buf_size)
-{
-    if (!buf || buf_size < 11) return;
-    struct tm tm = time_manager_get_local();
-    snprintf(buf, buf_size, "%04d-%02d-%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-}
-
-void time_manager_format_weekday(char *buf, size_t buf_size)
-{
-    if (!buf || buf_size < 4) return;
-    static const char *names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-    struct tm tm = time_manager_get_local();
-    snprintf(buf, buf_size, "%s", names[tm.tm_wday]);
 }

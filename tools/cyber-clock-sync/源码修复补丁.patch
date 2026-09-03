@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/main/ble_time_sync.c
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,489 @@
 +// main/ble_time_sync.c —— 可连接 BLE GATT 时间同步服务。
 +//
 +// 与 demo_ble.c 的区别：demo_ble 只做不可连接广播（仅证明射频可用），
@@ -27,11 +27,10 @@
 +
 +static const char *TAG = "ble_ts";
 +
-+// ---- UUID 定义（128 位，基础 UUID + 16 位短 ID）----
-+#define GATT_TS_SERVICE_UUID      0xFFC0
-+#define GATT_TS_CHAR_WRITE_UUID   0xFFC1
-+#define GATT_TS_CHAR_NOTIFY_UUID  0xFFC2
-+
++// ---- UUID 定义（128 位字面量，服务/特征各一）----
++// 注：广播与服务用的都是下面三组 128 位 UUID；协议里没有 16 位短 ID，
++// 特征号 FFC0/FFC1/FFC2 只是文档层面的习惯叫法（v10.3 清理了从未使用的
++// 16 位宏定义）。
 +static const ble_uuid128_t s_svc_uuid =
 +    BLE_UUID128_INIT(0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
 +                     0x00, 0x10, 0x00, 0x00, 0xC0, 0xFF, 0x00, 0x00);
@@ -54,8 +53,6 @@
 +static esp_timer_handle_t s_notify_timer;
 +static ble_ts_sync_cb_t s_sync_cb;
 +static char s_peer_name[32];
-+
-+#define DEVICE_NAME "CyberClock"
 +
 +// ---- 前向声明 ----
 +static int gap_event(struct ble_gap_event *event, void *arg);
@@ -89,27 +86,21 @@
 +    { 0 },  // 服务结束
 +};
 +
-+// ---- 工具：// 固定设备名，避免在 host 同步前读取 MAC 地址的时序问题。
++// 固定设备名（v10.3：删掉了重复的二次定义与 build_device_name() 包装——
++// 名字从不带 MAC 后缀，包装只会误导读者以为运行期会变化）
 +#define DEVICE_NAME "CyberClock"
-+
-+static void build_device_name(char *buf, size_t len)
-+{
-+    snprintf(buf, len, "%s", DEVICE_NAME);
-+}
 +
 +// ---- 广播 ----
 +static int start_advertising(void)
 +{
 +    struct ble_hs_adv_fields fields = {0};
-+    char name[32];
-+    build_device_name(name, sizeof(name));
 +
 +    // 广播包上限 31 字节：flags(3) + "CyberClock"(12) + 128位UUID(18) = 33 字节超限，
 +    // ble_gap_adv_set_fields() 会返回 BLE_HS_EMSGSIZE，导致广播启动失败、手机扫描不到设备。
 +    // 因此设备名放广播包，128 位服务 UUID 放扫描响应包（nRF Connect 主动扫描时仍可见）。
 +    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-+    fields.name = (const uint8_t *)name;
-+    fields.name_len = strlen(name);
++    fields.name = (const uint8_t *)DEVICE_NAME;
++    fields.name_len = strlen(DEVICE_NAME);
 +    fields.name_is_complete = 1;
 +
 +    int rc = ble_gap_adv_set_fields(&fields);
@@ -139,7 +130,7 @@
 +                            &params, gap_event, NULL);
 +    if (rc == 0) {
 +        s_state = BLE_TS_ADVERTISING;
-+        ESP_LOGI(TAG, "开始可连接广播: %s", name);
++        ESP_LOGI(TAG, "开始可连接广播: %s", DEVICE_NAME);
 +    }
 +    return rc;
 +}
@@ -202,8 +193,9 @@
 +    return os_mbuf_append(ctxt->om, json, n);
 +}
 +
-+// ---- 通知定时器：每 5 秒发送一次状态 ----
-+static void notify_task(void *arg)
++// ---- 通知定时器回调：每 5 秒发送一次状态 ----
++// （v10.3 改名：这是 esp_timer 回调、运行在 esp_timer 服务任务，不是独立任务）
++static void notify_timer_cb(void *arg)
 +{
 +    (void)arg;
 +    if (s_state != BLE_TS_CONNECTED && s_state != BLE_TS_SYNCED) return;
@@ -400,10 +392,9 @@
 +        goto fail;
 +    }
 +
-+    char name[32];
-+    // 注意：设备名在 on_sync 时才知道 MAC，这里先用基础名，广播时会用完整名
-+    snprintf(name, sizeof(name), "%s", DEVICE_NAME);
-+    ble_svc_gap_device_name_set(name);
++    // GAP 服务名直接用固定设备名（v10.3：旧注释声称"广播时会用完整名"，
++    // 实际名字从不带 MAC，删掉了误导性注释与中间缓冲区）
++    ble_svc_gap_device_name_set(DEVICE_NAME);
 +
 +    // BLE 安全配置：Just Works 配对，不绑定，不需要 MITM
 +    // 避免 iOS/Mac 连接时卡在配对流程
@@ -423,7 +414,7 @@
 +
 +    // 创建通知定时器
 +    esp_timer_create_args_t timer_args = {
-+        .callback = notify_task,
++        .callback = notify_timer_cb,
 +        .name = "ble_ts_notify",
 +    };
 +    if (esp_timer_create(&timer_args, &s_notify_timer) != ESP_OK) {
@@ -467,7 +458,12 @@
 +        nimble_port_deinit();
 +        s_initialized = false;
 +    } else {
-+        ESP_LOGE(TAG, "nimble_port_stop 失败: %d", rc);
++        // v10.3（审查 P3-4）：host 停止失败时也复位初始化标记。否则
++        // s_initialized 卡在 true，之后所有 start() 都返回 INVALID_STATE，
++        // BLE 直到整机重启前永久失效；复位后下次 start 会走完整初始化
++        // 路径重建 host（接受"半停"状态，好过永久锁死）。
++        ESP_LOGE(TAG, "nimble_port_stop 失败(%d)：强制复位初始化标记", rc);
++        s_initialized = false;
 +    }
 +
 +    if (s_host_stopped) {
@@ -546,7 +542,7 @@
 +void ble_time_sync_set_sync_callback(ble_ts_sync_cb_t cb);
 --- /dev/null
 +++ b/main/time_manager.c
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,247 @@
 +// main/time_manager.c —— 系统时间管理：NVS 持久化、时区、同步状态。
 +#include "time_manager.h"
 +#include "demo_radio.h"
@@ -555,6 +551,7 @@
 +#include "esp_timer.h"
 +#include "nvs_flash.h"
 +#include "nvs.h"
++#include "freertos/FreeRTOS.h"   // portMUX（状态快照临界区）
 +#include <string.h>
 +#include <sys/time.h>
 +
@@ -565,11 +562,39 @@
 +#define NVS_KEY_TZ     "tz_offset"
 +#define NVS_KEY_LAST   "last_unix"
 +
++// 视为合法的时间戳下限：2023-11-14，防止 NVS 脏数据把时钟拨回 1970 附近
++#define TIME_MIN_VALID_UNIX 1700000000LL
++
++// 时区偏移的最终防线：UTC-14 .. UTC+14。
++// USB 入口自带 ±14 校验；BLE 入口此前完全没有校验（int16 全范围可写穿，
++// 屏幕会显示公元前后），v10.3 起在这里统一拦截。
++#define TZ_MIN_SECONDS (-14 * 3600)
++#define TZ_MAX_SECONDS ( 14 * 3600)
++
 +static time_manager_state_t s_state;
 +static bool s_initialized;
 +
-+// 把状态写入 NVS。失败只打日志，不阻塞 UI。
-+static void persist_state(void)
++// ---- 延迟持久化（v10.3，对应审查 P3-2）----
++// set_unix_utc / set_timezone 可能运行在 NimBLE host 任务或 USB 任务里，
++// 旧版直接在这些回调里 nvs_commit：flash 擦除可达上百毫秒，会把协议栈
++// 任务卡住——与 v4 确立的"回调只置标志"原则相悖（当时只对 LVGL 成立）。
++// 现在 NVS 写入统一挪到 LVGL 定时器上下文：
++//   - set_* 只更新内存态并置 dirty 标志（volatile；调用方即生产者）
++//   - flush_pending() 每秒被调用一次（cyber_clock tick），有 dirty 才写
++// 掉电窗口：同步后 1 秒内断电会丢这次记录——重启后本就要重新对时，可接受。
++static volatile bool s_dirty_state;   // state blob 待写
++static volatile bool s_dirty_tz;      // tz_offset 键待写
++static volatile bool s_dirty_last;    // last_unix 键待写
++
++// ---- 状态快照的并发保护（v10.3，对应审查 P3-5）----
++// s_state 有两个写任务（BLE host / USB）与一个读任务（LVGL 定时器按值
++// 拷贝整个结构体）。RV32 上单个对齐字段读写原子，但多字段快照可能撕裂
++// 出半新半旧的组合。写路径与 get_state() 都包在极短临界区内，彻底杜绝。
++static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
++
++// 立即写 state blob。仅限进程级上下文（init 的开机清除路径）使用；
++// 运行期一律走 dirty 标志 + flush_pending()。
++static void persist_state_now(void)
 +{
 +    nvs_handle_t h;
 +    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
@@ -595,7 +620,13 @@
 +    nvs_handle_t h;
 +    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
 +        size_t len = sizeof(s_state);
-+        nvs_get_blob(h, NVS_KEY_STATE, &s_state, &len);
++        // 返回值检查（v10.3）：首次开机 blob 不存在属正常路径，只打调试日志；
++        // 未来若扩展 state 结构导致长度不符，这里同样静默回落默认值。
++        esp_err_t bl = nvs_get_blob(h, NVS_KEY_STATE, &s_state, &len);
++        if (bl != ESP_OK) {
++            ESP_LOGD(TAG, "state blob 未读取（首次开机或结构变更）: %s",
++                     esp_err_to_name(bl));
++        }
 +        int32_t tz = 0;
 +        if (nvs_get_i32(h, NVS_KEY_TZ, &tz) == ESP_OK && tz != 0) {
 +            s_state.tz_offset = tz;
@@ -604,7 +635,8 @@
 +        // 注意：深度睡眠期间 RTC 定时器仍在跑，但系统时间会重置，
 +        // 所以这里恢复的值仅用于"未同步时显示一个大概时间"。
 +        int64_t last_unix = 0;
-+        if (nvs_get_i64(h, NVS_KEY_LAST, &last_unix) == ESP_OK && last_unix > 1700000000) {
++        if (nvs_get_i64(h, NVS_KEY_LAST, &last_unix) == ESP_OK &&
++            last_unix > TIME_MIN_VALID_UNIX) {
 +            struct timeval tv = { .tv_sec = (time_t)last_unix, .tv_usec = 0 };
 +            settimeofday(&tv, NULL);
 +            ESP_LOGI(TAG, "从 NVS 恢复粗略时间: %lld", (long long)last_unix);
@@ -621,7 +653,7 @@
 +    //
 +    // 旧实现靠 "last_sync_ms > esp_timer_get_time()" 判断单调钟是否回退来识别重启；
 +    // 这条判据依赖 esp_timer 在复位后归零，在部分唤醒路径下并不成立，
-+    // 于是界面继续显示 SYNCED 而时间其实是错的 —— 正是本次要修的现象。
++    // 于是界面继续显示 SYNCED 而时间其实是错的 —— v10.1 修掉的现象。
 +    // 只清 synced，sync_count 是历史统计，保留。
 +    if (s_state.synced) {
 +        ESP_LOGI(TAG, "复位源=%d esp_timer=%lldms：恢复的时间不可信，"
@@ -629,7 +661,7 @@
 +                 (int)esp_reset_reason(),
 +                 (long long)(esp_timer_get_time() / 1000));
 +        s_state.synced = false;
-+        persist_state();
++        persist_state_now();
 +    }
 +
 +    s_initialized = true;
@@ -649,18 +681,15 @@
 +        return ESP_FAIL;
 +    }
 +
++    // 只更新内存态（临界区内仅字段赋值），NVS 写入交给 flush_pending()
++    int64_t now_ms = esp_timer_get_time() / 1000;
++    portENTER_CRITICAL(&s_state_mux);
 +    s_state.synced = true;
 +    s_state.sync_count++;
-+    s_state.last_sync_ms = esp_timer_get_time() / 1000;
-+
-+    // 持久化：状态 + 当前时间（供下次启动粗略恢复）。
-+    nvs_handle_t h;
-+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-+        nvs_set_blob(h, NVS_KEY_STATE, &s_state, sizeof(s_state));
-+        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)unix_seconds);
-+        nvs_commit(h);
-+        nvs_close(h);
-+    }
++    s_state.last_sync_ms = now_ms;
++    portEXIT_CRITICAL(&s_state_mux);
++    s_dirty_state = true;
++    s_dirty_last = true;   // last_unix 也要尽快落盘，不能等 5 分钟节流
 +
 +    ESP_LOGI(TAG, "时间已同步: UTC=%lld, 本地同步次数=%u",
 +             (long long)unix_seconds, s_state.sync_count);
@@ -670,15 +699,18 @@
 +esp_err_t time_manager_set_timezone(int32_t offset_seconds)
 +{
 +    if (!s_initialized) time_manager_init();
-+    s_state.tz_offset = offset_seconds;
-+    persist_state();
-+
-+    nvs_handle_t h;
-+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-+        nvs_set_i32(h, NVS_KEY_TZ, offset_seconds);
-+        nvs_commit(h);
-+        nvs_close(h);
++    // 范围校验（v10.3，P3-3）：BLE 入口此前无任何校验；这里是最终防线
++    if (offset_seconds < TZ_MIN_SECONDS || offset_seconds > TZ_MAX_SECONDS) {
++        ESP_LOGW(TAG, "时区偏移越界被拒绝: %ld 秒（允许 %d..%d）",
++                 (long)offset_seconds, TZ_MIN_SECONDS, TZ_MAX_SECONDS);
++        return ESP_ERR_INVALID_ARG;
 +    }
++    portENTER_CRITICAL(&s_state_mux);
++    s_state.tz_offset = offset_seconds;
++    portEXIT_CRITICAL(&s_state_mux);
++    // 只写 tz 键即可：读路径 blob 先读、tz 键覆盖，blob 里的旧值不会生效
++    // （v10.3，P4-7：旧版 blob + 键双写同一信息属冗余）
++    s_dirty_tz = true;
 +    return ESP_OK;
 +}
 +
@@ -697,69 +729,70 @@
 +    return tm;
 +}
 +
-+// 运行期间定期把当前时间回写 NVS（建议每秒调用一次，内部自行节流）。
++// 运行期间定期把待写状态与当前时间落盘（建议每秒调用一次，内部自行节流）。
 +//
-+// NVS_KEY_LAST 过去只在 set_unix_utc() 里写一次，后果是：连续开机 N 小时后断电，
-+// 下次启动恢复出来的时间整整慢 N 小时 —— 这是"关机再打开时间就不对了"的主要放大项。
-+// 按 5 分钟节奏回写后，断电恢复值的偏差被压到 5 分钟以内。
-+// 不做每分钟是为了控制 flash 擦写次数：NVS 有磨损均衡，但每天 288 次比 1440 次稳妥得多。
-+void time_manager_periodic_save(void)
++// 职责（v10.3 起合并了旧 periodic_save）：
++//   1. 把 set_unix_utc / set_timezone 置位的 dirty 标志消费掉——NVS 写入
++//      从 BLE/USB 任务上下文挪到了这里（LVGL 定时器，已持锁）；
++//   2. 每 5 分钟回写一次 last_unix：旧版只在同步瞬间写一次，开机 N 小时后
++//      断电，恢复值慢 N 小时；回写后偏差被压到 5 分钟以内。
++//      不做每分钟是为了控制 flash 擦写：每天 288 次比 1440 次稳妥得多。
++void time_manager_flush_pending(void)
 +{
-+    if (!s_state.synced) return;   // 未同步时时间本就不可信，不值得写
++    if (!s_initialized) return;
 +
++    // 摘下 dirty 位（本函数只在 LVGL 定时器上下文被调，单消费者）
++    bool d_state = s_dirty_state; s_dirty_state = false;
++    bool d_tz    = s_dirty_tz;    s_dirty_tz    = false;
++    bool d_last  = s_dirty_last;  s_dirty_last  = false;
++
++    // 5 分钟节流的 last_unix 回写（仅同步状态下才有意义）
 +    struct tm tm = time_manager_get_local();
-+    if (tm.tm_sec != 0 || tm.tm_min % 5 != 0) return;
-+
++    bool periodic = s_state.synced && tm.tm_sec == 0 && tm.tm_min % 5 == 0;
 +    static int last_min = -1;
-+    if (tm.tm_min == last_min) return;   // 同一分钟内不重复写
-+    last_min = tm.tm_min;
++    if (periodic && tm.tm_min == last_min) periodic = false;  // 同分钟不重写
++    else if (periodic) last_min = tm.tm_min;
++
++    if (!d_state && !d_tz && !d_last && !periodic) return;
 +
 +    nvs_handle_t h;
-+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-+        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)time_manager_get_unix_utc());
-+        nvs_commit(h);
-+        nvs_close(h);
++    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
++        // 打开失败：dirty 放回去，下一秒重试（时间戳类不重试，等下个节流点）
++        if (d_state) s_dirty_state = true;
++        if (d_tz)    s_dirty_tz    = true;
++        if (d_last)  s_dirty_last  = true;
++        return;
 +    }
++    if (d_state)
++        nvs_set_blob(h, NVS_KEY_STATE, &s_state, sizeof(s_state));
++    if (d_tz)
++        nvs_set_i32(h, NVS_KEY_TZ, s_state.tz_offset);
++    if (d_last || periodic)
++        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)time_manager_get_unix_utc());
++    nvs_commit(h);
++    nvs_close(h);
 +}
 +
 +time_manager_state_t time_manager_get_state(void)
 +{
-+    return s_state;
++    time_manager_state_t snap;
++    portENTER_CRITICAL(&s_state_mux);
++    snap = s_state;
++    portEXIT_CRITICAL(&s_state_mux);
++    return snap;
 +}
 +
 +bool time_manager_is_reliable(uint32_t max_age_seconds)
 +{
-+    if (!s_state.synced) return false;
++    time_manager_state_t st = time_manager_get_state();
++    if (!st.synced) return false;
 +    int64_t now_ms = esp_timer_get_time() / 1000;
-+    int64_t elapsed = (now_ms - s_state.last_sync_ms) / 1000;
++    int64_t elapsed = (now_ms - st.last_sync_ms) / 1000;
 +    return elapsed >= 0 && (uint32_t)elapsed <= max_age_seconds;
-+}
-+
-+void time_manager_format_hms(char *buf, size_t buf_size)
-+{
-+    if (!buf || buf_size < 9) return;
-+    struct tm tm = time_manager_get_local();
-+    snprintf(buf, buf_size, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
-+}
-+
-+void time_manager_format_ymd(char *buf, size_t buf_size)
-+{
-+    if (!buf || buf_size < 11) return;
-+    struct tm tm = time_manager_get_local();
-+    snprintf(buf, buf_size, "%04d-%02d-%02d",
-+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-+}
-+
-+void time_manager_format_weekday(char *buf, size_t buf_size)
-+{
-+    if (!buf || buf_size < 4) return;
-+    static const char *names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-+    struct tm tm = time_manager_get_local();
-+    snprintf(buf, buf_size, "%s", names[tm.tm_wday]);
 +}
 --- /dev/null
 +++ b/main/time_manager.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,46 @@
 +#pragma once
 +#include <stdbool.h>
 +#include <stdint.h>
@@ -795,27 +828,20 @@
 +// 获取当前 UTC Unix 时间戳（秒）。
 +time_t time_manager_get_unix_utc(void);
 +
-+// 运行期间定期把当前时间回写 NVS，缩小断电后恢复值的偏差。
-+// 可放心每秒调用：内部按 5 分钟节流；未同步时直接返回，不产生 flash 写入。
-+void time_manager_periodic_save(void);
++// 运行期间把待写状态落盘（消费 set_* 置位的 dirty 标志），并按 5 分钟
++// 节流回写当前时间，缩小断电后恢复值的偏差。
++// 建议每秒调用一次（LVGL 定时器上下文）：NVS 写入全部收敛到这里，
++// BLE/USB 任务只更新内存态；未同步且无待写时直接返回，不产生 flash 写入。
++void time_manager_flush_pending(void);
 +
-+// 获取当前状态的只读快照。
++// 获取当前状态的只读快照（临界区内拷贝，多字段不会撕裂）。
 +time_manager_state_t time_manager_get_state(void);
 +
 +// 判断时间是否可信（已同步过且距上次同步不超过 max_age_seconds）。
 +bool time_manager_is_reliable(uint32_t max_age_seconds);
-+
-+// 格式化本地时间为 "HH:MM:SS"，写入 buf（至少 9 字节）。
-+void time_manager_format_hms(char *buf, size_t buf_size);
-+
-+// 格式化本地日期为 "YYYY-MM-DD"，写入 buf（至少 11 字节）。
-+void time_manager_format_ymd(char *buf, size_t buf_size);
-+
-+// 格式化星期为英文缩写 "MON".."SUN"，写入 buf（至少 4 字节）。
-+void time_manager_format_weekday(char *buf, size_t buf_size);
 --- /dev/null
 +++ b/main/usb_time_sync.c
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,134 @@
 +// main/usb_time_sync.c —— USB 串口对时(免蓝牙方案)。
 +//
 +// 利用刷固件用的同一条 USB 线(USB Serial/JTAG)接收文本对时命令:
@@ -865,8 +891,9 @@
 +            printf("ERR TS\n");
 +            return;
 +        }
-+        // 可选第二参数:时区小时数
-+        long tz = 8;
++        // 可选第二参数:时区小时数；省缺时回显设备当前时区（v10.3：旧版
++        // 硬编码回显 TZ=8，设备实际时区可能根本不是 +8）
++        long tz = 0;
 +        if (end && *end == ' ') {
 +            tz = strtol(end, NULL, 10);
 +            if (tz < -14 || tz > 14) {
@@ -874,6 +901,8 @@
 +                return;
 +            }
 +            time_manager_set_timezone((int32_t)tz * 3600);
++        } else {
++            tz = time_manager_get_state().tz_offset / 3600;
 +        }
 +        if (time_manager_set_unix_utc((time_t)ts) == ESP_OK) {
 +            printf("OK TS=%lld TZ=%ld\n", ts, tz);
@@ -963,7 +992,7 @@
 +esp_err_t usb_time_sync_start(void);
 --- /dev/null
 +++ b/main/cyber_clock.c
-@@ -0,0 +1,1489 @@
+@@ -0,0 +1,1483 @@
 +// main/cyber_clock.c —— 赛博朋克时钟：四页面状态机（v10 B1++ 表盘重制）
 +//
 +// v8/v9 页面动线（240x320 竖屏，三个实体按键）：
@@ -1719,11 +1748,10 @@
 +// 同步页内容刷新（每秒 + 状态变化时调用；只在 LVGL 上下文执行）
 +static void sync_page_update(void)
 +{
-+    time_t now = time_manager_get_unix_utc();
++    // v10.3：统一走 time_manager_get_local()（gmtime_r + 偏移），不再用
++    // localtime_r——系统 TZ 若被设置，两种算法会分叉（审查 P4-5）
 +    time_manager_state_t st = time_manager_get_state();
-+    time_t local = now + st.tz_offset;
-+    struct tm tm;
-+    localtime_r(&local, &tm);
++    struct tm tm = time_manager_get_local();
 +    const cyber_theme_t *t = &THEMES[s_theme_idx];
 +    // 40 字节：容纳 "2024-12-31  WED"（15 字节）与状态文案的最大长度
 +    char buf[40];
@@ -2014,9 +2042,7 @@
 +{
 +    time_t now = time_manager_get_unix_utc();
 +    time_manager_state_t st = time_manager_get_state();
-+    time_t local = now + st.tz_offset;
-+    struct tm tm;
-+    localtime_r(&local, &tm);
++    struct tm tm = time_manager_get_local();   // 统一时区换算入口（审查 P4-5）
 +
 +    // HH:MM（主字 + 双色差残影同步刷新）
 +    // 48 字节：容纳各格式理论最大值（含终端行 "> UTC-12_"、底流 ">> 0xFFFFFF"）
@@ -2187,17 +2213,14 @@
 +    }
 +
 +    // ---- 每秒刷新当前页面 ----
-+    time_manager_state_t st = time_manager_get_state();
-+    time_t now = time_manager_get_unix_utc();
-+    time_t local = now + st.tz_offset;
-+    struct tm tm;
-+    localtime_r(&local, &tm);
++    struct tm tm = time_manager_get_local();   // 统一时区换算入口（审查 P4-5）
 +
 +    if (tm.tm_sec != s_last_sec) {
 +        s_last_sec = tm.tm_sec;
-+        // 把当前时间回写 NVS（内部 5 分钟节流）：下次断电重启时恢复值才不会
-+        // 慢掉整个开机时长。放在这里是为了任何页面都能生效。
-+        time_manager_periodic_save();
++        // 落盘待写状态 + 5 分钟节流回写时间（v10.3 起 set_* 的 NVS 写入
++        // 也收敛到这里，BLE/USB 任务不再直接碰 flash）：
++        // 放在这里是为了任何页面都能生效。
++        time_manager_flush_pending();
 +        // v10.2 空闲降亮度：超过 DIM_AFTER_S 无按键 → 背光压到 DIM_LEVEL。
 +        // 不碰 s_brightness / NVS，按键路径负责恢复。
 +        if (!s_dimmed &&
@@ -2465,32 +2488,105 @@
 +void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 --- a/main/main.c
 +++ b/main/main.c
-@@ -15,10 +15,14 @@
+@@ -1,110 +1,61 @@
+-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
++// main/main.c —— FoloToy AI Passport 启动入口 + 按键转发。
+ //
+-// 按键语义(全局统一):
+-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
+-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
+-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
++// v8 起开机直进 CyberClock 应用（同步页→表盘→菜单的页面状态机由
++// cyber_clock.c 自管）。v10.3 移除了不再可达的上游 demo 菜单与其余演示页
++// 入口表——未被引用的 demo_* 代码由链接器 --gc-sections 自动裁剪，
++// 同时消除了 enter_menu 的 -Wunused-function 告警（审查 P3-1）。
++//
++// 按键语义（全局统一，由应用自行解释）：
++//   上/下 短按   页面自定义
++//   确定  短按   页面自定义
++//   确定  长按   页面自定义（全局"上一层"导航）
+ #include "bsp_i2c.h"
+ #include "bsp_display.h"
+ #include "bsp_button.h"
+-#include "bsp_audio.h"
+ #include "bsp_battery.h"
+ #include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
+ #include "demo.h"
+-#include "ui_pixel.h"
  #include "lvgl.h"
  #include "esp_log.h"
- #include "esp_sleep.h"
 +#include "esp_pm.h"
+ #include "esp_sleep.h"
 +#include "time_manager.h"
 +#include "usb_time_sync.h"
  
  static const char *TAG = "main";
  
++// 唯一应用：CyberClock（demo.h 中其余 demo_* 声明保留，但不再有入口）
  static const demo_entry_t DEMOS[] = {
+-    { "Display", demo_display_enter, demo_display_exit, demo_display_key },
+-    { "Button",  demo_button_enter,  demo_button_exit,  demo_button_key  },
+-    { "Audio",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
+-    { "Battery", demo_battery_enter, demo_battery_exit, demo_battery_key },
+-    { "Wi-Fi",   demo_wifi_enter,    demo_wifi_exit,    demo_wifi_key    },
+-    { "BLE",     demo_ble_enter,     demo_ble_exit,     demo_ble_key     },
+-    { "Low Power", demo_low_power_enter, demo_low_power_exit, demo_low_power_key },
 +    { "CyberClock", demo_cyber_clock_enter, demo_cyber_clock_exit, demo_cyber_clock_key },
-     { "Display", demo_display_enter, demo_display_exit, demo_display_key },
-     { "Button",  demo_button_enter,  demo_button_exit,  demo_button_key  },
-     { "Audio",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
-@@ -75,36 +79,33 @@
- }
+ };
+ #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
+-
+-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
+-static bool s_ok[DEMO_COUNT];
+-
+-static lv_obj_t *s_menu_scr;
+-static lv_obj_t *s_cards[DEMO_COUNT];
+-static lv_obj_t *s_rows[DEMO_COUNT];
+-static lv_obj_t *s_mascot;
+-static int  s_sel;                 // 当前选中项
+-static int  s_active = -1;         // 当前所在演示页;-1 = 在菜单
+-
+-static void menu_refresh(void) {
+-    for (size_t i = 0; i < DEMO_COUNT; i++) {
+-        lv_label_set_text_fmt(s_rows[i], "%s%s",
+-                              DEMOS[i].name,
+-                              s_ok[i] ? "" : "  [FAIL]");
+-        ui_pixel_set_selected(s_cards[i], (int)i == s_sel, s_ok[i]);
+-        lv_obj_set_style_text_color(s_rows[i],
+-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
+-    }
+-}
+-
+-static void menu_build(void) {
+-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+-
+-    for (size_t i = 0; i < DEMO_COUNT; i++) {
+-        int x = 11 + (int)(i % 2) * 112;
+-        int y = 52 + (int)(i / 2) * 47;
+-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
+-        s_rows[i] = lv_label_create(s_cards[i]);
+-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
+-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
+-        lv_obj_center(s_rows[i]);
+-    }
+-
+-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
+-
+-    menu_refresh();
+-    lv_screen_load(s_menu_scr);
+-}
+-
+-static void enter_menu(void) {
+-    s_active = -1;
+-    menu_build();
+-}
++_Static_assert(DEMO_COUNT == 1, "此入口只服务 CyberClock；新增应用需恢复菜单");
  
  // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
-+// v8 起开机直进 CyberClock 应用(同步页→表盘→菜单的页面状态机由 cyber_clock.c
-+// 自管),所有按键直接转发,不再经过 demo 菜单。
  static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
      (void)user;
      if (!bsp_lvgl_lock(500)) return;
  
-     if (s_active >= 0) {
+-    if (s_active >= 0) {
 -        if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
 -            DEMOS[s_active].exit();
 -            enter_menu();
@@ -2510,8 +2606,9 @@
 -        } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
 -            ui_pixel_mascot_jump(s_mascot);
 -        }
-+        DEMOS[s_active].key(btn, ev);   // 长按返回等导航由应用内部处理
-     }
+-    }
++    DEMOS[0].key(btn, ev);   // v8 起唯一应用：按键直接转发，导航由应用内状态机处理
++
      bsp_lvgl_unlock();
  }
  
@@ -2533,47 +2630,49 @@
      esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
      if (wakeup != ESP_SLEEP_WAKEUP_UNDEFINED) {
          ESP_LOGI(TAG, "休眠唤醒原因: %d", wakeup);
-@@ -113,6 +114,10 @@
+@@ -113,27 +64,28 @@
      bsp_i2c_init();
      bsp_i2c_scan();
  
+-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
+-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
 +    // 时间管理 + USB 串口对时(常驻,任意页面可用,不依赖蓝牙)
 +    time_manager_init();
 +    usb_time_sync_start();
 +
-     // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-     // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
++    // 屏幕是本应用的 UI 载体，失败就没有可用界面 —— 打清楚日志后退出。
      if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-@@ -124,16 +129,21 @@
+-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
++        ESP_LOGE(TAG, "显示/LVGL 初始化失败,无法继续。"
+                       "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
+                  BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
+         return;
+     }
      bsp_display_backlight(100);
  
-     // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
+-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
 -    s_ok[0] = true;                                   // Display 已确认可用
 -    s_ok[1] = (bsp_button_init(on_key, NULL) == ESP_OK);
 -    s_ok[2] = (bsp_audio_init() == ESP_OK);
 -    s_ok[3] = (bsp_battery_init() == ESP_OK);
 -    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
 -    s_ok[5] = true;
-+    s_ok[0] = true;                                   // CyberClock（时间+BLE，页面内自处理）
-+    s_ok[1] = true;                                   // Display 已确认可用
-+    s_ok[2] = (bsp_button_init(on_key, NULL) == ESP_OK);
-+    s_ok[3] = (bsp_audio_init() == ESP_OK);
-+    s_ok[4] = (bsp_battery_init() == ESP_OK);
-+    s_ok[5] = true;                                    // 页面内按需初始化并显示错误
-     s_ok[6] = true;
-+    s_ok[7] = true;
- 
+-    s_ok[6] = true;
+-
 -    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
++    // 其余外设单项失败不阻塞（v10.3 随菜单清理简化了假状态数组）：
++    //   按键失败 → 无输入，仅显示；电池失败 → 表盘回落 50%/3700mV 占位值
++    bool btn_ok = (bsp_button_init(on_key, NULL) == ESP_OK);
++    bool bat_ok = (bsp_battery_init() == ESP_OK);
++
 +    // v8：开机直进 CyberClock 应用首屏（时间同步页）。设备无 RTC 电池，
 +    // 开机时间必然不可信，先进同步页对时是自洽的动线（USB/蓝牙任一同步后
-+    // 自动进入表盘）。上游 demo 菜单代码保留但不再作为入口。
-+    s_active = 0;
++    // 按 OK 进表盘）。
 +    if (bsp_lvgl_lock(1000)) { DEMOS[0].enter(); bsp_lvgl_unlock(); }
  
 -    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
 -             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
-+    ESP_LOGI(TAG, "就绪:Clock=%d Display=%d Button=%d Audio=%d Battery=%d",
-+             s_ok[0], s_ok[1], s_ok[2], s_ok[3], s_ok[4]);
++    ESP_LOGI(TAG, "就绪: Clock=1 Button=%d Battery=%d", btn_ok, bat_ok);
  }
 --- a/main/CMakeLists.txt
 +++ b/main/CMakeLists.txt

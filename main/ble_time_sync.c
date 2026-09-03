@@ -24,11 +24,10 @@
 
 static const char *TAG = "ble_ts";
 
-// ---- UUID 定义（128 位，基础 UUID + 16 位短 ID）----
-#define GATT_TS_SERVICE_UUID      0xFFC0
-#define GATT_TS_CHAR_WRITE_UUID   0xFFC1
-#define GATT_TS_CHAR_NOTIFY_UUID  0xFFC2
-
+// ---- UUID 定义（128 位字面量，服务/特征各一）----
+// 注：广播与服务用的都是下面三组 128 位 UUID；协议里没有 16 位短 ID，
+// 特征号 FFC0/FFC1/FFC2 只是文档层面的习惯叫法（v10.3 清理了从未使用的
+// 16 位宏定义）。
 static const ble_uuid128_t s_svc_uuid =
     BLE_UUID128_INIT(0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
                      0x00, 0x10, 0x00, 0x00, 0xC0, 0xFF, 0x00, 0x00);
@@ -51,8 +50,6 @@ static SemaphoreHandle_t s_host_stopped;
 static esp_timer_handle_t s_notify_timer;
 static ble_ts_sync_cb_t s_sync_cb;
 static char s_peer_name[32];
-
-#define DEVICE_NAME "CyberClock"
 
 // ---- 前向声明 ----
 static int gap_event(struct ble_gap_event *event, void *arg);
@@ -86,27 +83,21 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     { 0 },  // 服务结束
 };
 
-// ---- 工具：// 固定设备名，避免在 host 同步前读取 MAC 地址的时序问题。
+// 固定设备名（v10.3：删掉了重复的二次定义与 build_device_name() 包装——
+// 名字从不带 MAC 后缀，包装只会误导读者以为运行期会变化）
 #define DEVICE_NAME "CyberClock"
-
-static void build_device_name(char *buf, size_t len)
-{
-    snprintf(buf, len, "%s", DEVICE_NAME);
-}
 
 // ---- 广播 ----
 static int start_advertising(void)
 {
     struct ble_hs_adv_fields fields = {0};
-    char name[32];
-    build_device_name(name, sizeof(name));
 
     // 广播包上限 31 字节：flags(3) + "CyberClock"(12) + 128位UUID(18) = 33 字节超限，
     // ble_gap_adv_set_fields() 会返回 BLE_HS_EMSGSIZE，导致广播启动失败、手机扫描不到设备。
     // 因此设备名放广播包，128 位服务 UUID 放扫描响应包（nRF Connect 主动扫描时仍可见）。
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.name = (const uint8_t *)name;
-    fields.name_len = strlen(name);
+    fields.name = (const uint8_t *)DEVICE_NAME;
+    fields.name_len = strlen(DEVICE_NAME);
     fields.name_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
@@ -136,7 +127,7 @@ static int start_advertising(void)
                             &params, gap_event, NULL);
     if (rc == 0) {
         s_state = BLE_TS_ADVERTISING;
-        ESP_LOGI(TAG, "开始可连接广播: %s", name);
+        ESP_LOGI(TAG, "开始可连接广播: %s", DEVICE_NAME);
     }
     return rc;
 }
@@ -199,8 +190,9 @@ static int gatt_svr_chr_read(uint16_t conn_handle, uint16_t attr_handle,
     return os_mbuf_append(ctxt->om, json, n);
 }
 
-// ---- 通知定时器：每 5 秒发送一次状态 ----
-static void notify_task(void *arg)
+// ---- 通知定时器回调：每 5 秒发送一次状态 ----
+// （v10.3 改名：这是 esp_timer 回调、运行在 esp_timer 服务任务，不是独立任务）
+static void notify_timer_cb(void *arg)
 {
     (void)arg;
     if (s_state != BLE_TS_CONNECTED && s_state != BLE_TS_SYNCED) return;
@@ -397,10 +389,9 @@ esp_err_t ble_time_sync_start(void)
         goto fail;
     }
 
-    char name[32];
-    // 注意：设备名在 on_sync 时才知道 MAC，这里先用基础名，广播时会用完整名
-    snprintf(name, sizeof(name), "%s", DEVICE_NAME);
-    ble_svc_gap_device_name_set(name);
+    // GAP 服务名直接用固定设备名（v10.3：旧注释声称"广播时会用完整名"，
+    // 实际名字从不带 MAC，删掉了误导性注释与中间缓冲区）
+    ble_svc_gap_device_name_set(DEVICE_NAME);
 
     // BLE 安全配置：Just Works 配对，不绑定，不需要 MITM
     // 避免 iOS/Mac 连接时卡在配对流程
@@ -420,7 +411,7 @@ esp_err_t ble_time_sync_start(void)
 
     // 创建通知定时器
     esp_timer_create_args_t timer_args = {
-        .callback = notify_task,
+        .callback = notify_timer_cb,
         .name = "ble_ts_notify",
     };
     if (esp_timer_create(&timer_args, &s_notify_timer) != ESP_OK) {
@@ -464,7 +455,12 @@ void ble_time_sync_stop(void)
         nimble_port_deinit();
         s_initialized = false;
     } else {
-        ESP_LOGE(TAG, "nimble_port_stop 失败: %d", rc);
+        // v10.3（审查 P3-4）：host 停止失败时也复位初始化标记。否则
+        // s_initialized 卡在 true，之后所有 start() 都返回 INVALID_STATE，
+        // BLE 直到整机重启前永久失效；复位后下次 start 会走完整初始化
+        // 路径重建 host（接受"半停"状态，好过永久锁死）。
+        ESP_LOGE(TAG, "nimble_port_stop 失败(%d)：强制复位初始化标记", rc);
+        s_initialized = false;
     }
 
     if (s_host_stopped) {

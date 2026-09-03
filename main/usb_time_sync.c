@@ -47,8 +47,9 @@ static void handle_line(const char *line)
             printf("ERR TS\n");
             return;
         }
-        // 可选第二参数:时区小时数
-        long tz = 8;
+        // 可选第二参数:时区小时数；省缺时回显设备当前时区（v10.3：旧版
+        // 硬编码回显 TZ=8，设备实际时区可能根本不是 +8）
+        long tz = 0;
         if (end && *end == ' ') {
             tz = strtol(end, NULL, 10);
             if (tz < -14 || tz > 14) {
@@ -56,6 +57,8 @@ static void handle_line(const char *line)
                 return;
             }
             time_manager_set_timezone((int32_t)tz * 3600);
+        } else {
+            tz = time_manager_get_state().tz_offset / 3600;
         }
         if (time_manager_set_unix_utc((time_t)ts) == ESP_OK) {
             printf("OK TS=%lld TZ=%ld\n", ts, tz);

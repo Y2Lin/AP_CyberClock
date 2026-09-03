@@ -753,11 +753,10 @@ static void build_sync_page(void)
 // 同步页内容刷新（每秒 + 状态变化时调用；只在 LVGL 上下文执行）
 static void sync_page_update(void)
 {
-    time_t now = time_manager_get_unix_utc();
+    // v10.3：统一走 time_manager_get_local()（gmtime_r + 偏移），不再用
+    // localtime_r——系统 TZ 若被设置，两种算法会分叉（审查 P4-5）
     time_manager_state_t st = time_manager_get_state();
-    time_t local = now + st.tz_offset;
-    struct tm tm;
-    localtime_r(&local, &tm);
+    struct tm tm = time_manager_get_local();
     const cyber_theme_t *t = &THEMES[s_theme_idx];
     // 40 字节：容纳 "2024-12-31  WED"（15 字节）与状态文案的最大长度
     char buf[40];
@@ -1048,9 +1047,7 @@ static void update_time_display(void)
 {
     time_t now = time_manager_get_unix_utc();
     time_manager_state_t st = time_manager_get_state();
-    time_t local = now + st.tz_offset;
-    struct tm tm;
-    localtime_r(&local, &tm);
+    struct tm tm = time_manager_get_local();   // 统一时区换算入口（审查 P4-5）
 
     // HH:MM（主字 + 双色差残影同步刷新）
     // 48 字节：容纳各格式理论最大值（含终端行 "> UTC-12_"、底流 ">> 0xFFFFFF"）
@@ -1221,17 +1218,14 @@ static void tick(lv_timer_t *timer)
     }
 
     // ---- 每秒刷新当前页面 ----
-    time_manager_state_t st = time_manager_get_state();
-    time_t now = time_manager_get_unix_utc();
-    time_t local = now + st.tz_offset;
-    struct tm tm;
-    localtime_r(&local, &tm);
+    struct tm tm = time_manager_get_local();   // 统一时区换算入口（审查 P4-5）
 
     if (tm.tm_sec != s_last_sec) {
         s_last_sec = tm.tm_sec;
-        // 把当前时间回写 NVS（内部 5 分钟节流）：下次断电重启时恢复值才不会
-        // 慢掉整个开机时长。放在这里是为了任何页面都能生效。
-        time_manager_periodic_save();
+        // 落盘待写状态 + 5 分钟节流回写时间（v10.3 起 set_* 的 NVS 写入
+        // 也收敛到这里，BLE/USB 任务不再直接碰 flash）：
+        // 放在这里是为了任何页面都能生效。
+        time_manager_flush_pending();
         // v10.2 空闲降亮度：超过 DIM_AFTER_S 无按键 → 背光压到 DIM_LEVEL。
         // 不碰 s_brightness / NVS，按键路径负责恢复。
         if (!s_dimmed &&
