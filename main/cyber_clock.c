@@ -143,6 +143,10 @@ typedef enum {
 #define BRIGHT_STEP  10
 // 出厂默认亮度：不再拉满 100（满亮度下 OLED 偏刺眼且功耗高）
 #define BRIGHT_DEFAULT 80
+// v10.2 空闲降亮度：长时间无按键后背光压到 DIM_LEVEL（用户设定 s_brightness
+// 不变、不写 NVS，任意按键立即恢复）。背光是整机最大的持续耗电项之一。
+#define DIM_AFTER_S 90
+#define DIM_LEVEL   20
 
 // NVS（与 time_manager 同命名空间，NVS 已在其 init 中完成 flash 初始化）
 #define NVS_NS_BRIGHT    "cyber_clk"
@@ -242,6 +246,8 @@ static int s_batt_mv = 0;
 static int64_t s_enter_time;
 static bool s_ble_started = false;
 static volatile bool s_sync_pending;      // BLE 同步事件标志（跨任务传递）
+static int64_t s_last_key_us;             // 最近一次按键时刻（空闲降亮度用）
+static bool s_dimmed;                     // 当前处于空闲降亮状态
 
 // ============================================================================
 // 工具函数
@@ -1226,6 +1232,13 @@ static void tick(lv_timer_t *timer)
         // 把当前时间回写 NVS（内部 5 分钟节流）：下次断电重启时恢复值才不会
         // 慢掉整个开机时长。放在这里是为了任何页面都能生效。
         time_manager_periodic_save();
+        // v10.2 空闲降亮度：超过 DIM_AFTER_S 无按键 → 背光压到 DIM_LEVEL。
+        // 不碰 s_brightness / NVS，按键路径负责恢复。
+        if (!s_dimmed &&
+            esp_timer_get_time() - s_last_key_us > (int64_t)DIM_AFTER_S * 1000000) {
+            s_dimmed = true;
+            bsp_display_backlight(DIM_LEVEL);
+        }
         if (s_page == PAGE_CLOCK) {
             update_time_display();
             // 每 5 秒刷新电池
@@ -1261,6 +1274,8 @@ void demo_cyber_clock_enter(void)
     s_mode = MODE_FULL;
     s_menu_sel = 0;
     brightness_load();
+    s_last_key_us = esp_timer_get_time();   // 空闲降亮度计时起点
+    s_dimmed = false;
 
     // 根屏幕 + 四个页面容器（互斥显示，切换即隐藏其余）
     s_scr = lv_obj_create(NULL);
@@ -1289,11 +1304,11 @@ void demo_cyber_clock_enter(void)
     // BLE 同步回调只注册一次（跨页面共用）
     ble_time_sync_set_sync_callback(on_ble_sync);
 
-    // 开机首屏：时间同步页（内部自动开启 BLE）
-    page_switch(PAGE_SYNC);
-
-    // 启动 LVGL 定时器（100ms 间隔，内部判断秒数变化）
+    // 启动 LVGL 定时器（先建后切页：page_switch 内会按目标页调整 tick 周期）
     s_timer = lv_timer_create(tick, 100, NULL);
+
+    // 开机首屏：时间同步页（内部自动开启 BLE；tick 周期随即调为 250ms）
+    page_switch(PAGE_SYNC);
 }
 
 void demo_cyber_clock_exit(void)
@@ -1383,6 +1398,14 @@ void demo_cyber_clock_exit(void)
 // ============================================================================
 void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 {
+    // v10.2：任意按键刷新"最近活动"时刻；若正处于空闲降亮，先恢复用户设定
+    // 亮度（后续 switch 内的 brightness_apply 用的是 s_brightness，不受影响）。
+    s_last_key_us = esp_timer_get_time();
+    if (s_dimmed) {
+        s_dimmed = false;
+        brightness_apply();
+    }
+
     // ---- OK 长按：全局"上一层"导航 ----
     //   表盘/同步页 → 菜单页；菜单页 → 表盘；亮度页 → 菜单页
     if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {

@@ -47,7 +47,7 @@ void demo_button_enter(void) {
     lv_obj_t *panel = ui_pixel_panel_create(s_scr, 18, 58, 204, 184, UI_PAPER);
 
     s_mv = lv_label_create(panel);
-    lv_obj_set_style_text_font(s_mv, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_mv, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_mv, lv_color_hex(UI_SKY_DARK), 0);
     lv_obj_align(s_mv, LV_ALIGN_TOP_MID, 0, 8);
     lv_label_set_text(s_mv, "-- mV");

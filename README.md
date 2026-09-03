@@ -53,6 +53,13 @@ boot -> [TIME SYNC page]  --OK: go to clock (BT turns off)-->  [Clock face]
 ### Brightness (v8)
 - UP/DOWN adjusts backlight in 10% steps (10–100%) on the Brightness page
 - Factory default 80% (v10.1); user adjustments persist to NVS and are restored on boot
+- **Idle auto-dim** (v10.2): after 90 s without a key press the backlight drops to 20%; any key restores the configured level instantly (the stored value never changes)
+
+### Power (v10.2)
+- Default CPU clock lowered from 160 to 80 MHz, with DFS enabled: 80 MHz busy, 40 MHz idle
+- Off the clock face the refresh tick relaxes from 100 ms to 250 ms, cutting idle wakeups
+- No light sleep: the USB console and USB time sync must stay online
+- Bluetooth belongs to the sync page only (see below); the clock face keeps the radio off
 
 ### Misc
 - Time and timezone persisted to NVS and rewritten every 5 minutes while running, so a power cut costs at most 5 minutes of drift (v10.1)

@@ -15,6 +15,7 @@
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "esp_pm.h"
 #include "time_manager.h"
 #include "usb_time_sync.h"
 
@@ -92,6 +93,19 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
+
+    // v10.2 功耗：动态调频（DFS）——忙时 80MHz、空闲降到 40MHz（默认主频已是 80）。
+    // SPI/I2C 等驱动在 CONFIG_PM_ENABLE 下自动持有 PM 锁，传输期间不会被降频打断。
+    // 不开 light sleep：USB-Serial-JTAG 控制台与 USB 对时在睡眠期间不可用。
+    esp_pm_config_t pm_cfg = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 40,
+        .light_sleep_enable = false,
+    };
+    esp_err_t pm_err = esp_pm_configure(&pm_cfg);
+    ESP_LOGI(TAG, "电源管理 DFS 40-80MHz: %s",
+             pm_err == ESP_OK ? "已启用" : esp_err_to_name(pm_err));
+
     esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
     if (wakeup != ESP_SLEEP_WAKEUP_UNDEFINED) {
         ESP_LOGI(TAG, "休眠唤醒原因: %d", wakeup);
