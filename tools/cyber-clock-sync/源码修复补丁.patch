@@ -2566,16 +2566,17 @@ index 0000000..56df0ac
 +bool time_manager_is_reliable(uint32_t max_age_seconds);
 diff --git a/main/usb_time_sync.c b/main/usb_time_sync.c
 new file mode 100644
-index 0000000..6932a40
+index 0000000..d78ede5
 --- /dev/null
 +++ b/main/usb_time_sync.c
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,336 @@
 +// main/usb_time_sync.c —— USB 串口对时(免蓝牙方案)。
 +//
 +// 利用刷固件用的同一条 USB 线(USB Serial/JTAG)接收文本对时命令:
 +//   PING                 -> PONG                    (连通性/版本探测)
 +//   T <unix> [tz_hours]  -> OK TS=... TZ=...        (设置时间,可选时区)
 +//   Q                    -> {"ts":...,"tz":...,"synced":true}
++//   FAP_SCREENSHOT_V1    -> FAP_SCREENSHOT_V1 <w> <h> RGB565LE <len>\n<二进制>
 +//
 +// 实现要点:
 +//   - 安装 usb_serial_jtag 驱动后调用 usb_serial_jtag_vfs_use_driver(),
@@ -2606,116 +2607,191 @@ index 0000000..6932a40
 +// ============================================================================
 +// FAP_SCREENSHOT_V1 运行时截屏（AI Passport 社区发布助手的连接证明协议）
 +//
-+// 为什么不用 lv_snapshot：本项目 LVGL 走 64KB 内置内存池，全屏 RGB565
-+// 快照需要 240*320*2 = 150KB，池内必然分配失败。因此改为拦截显示刷新：
-+// 截屏时临时包装 flush 回调，令整屏重绘一次，把每个 20 行分块在送显
-+// 之前拼进系统堆分配的缓冲 —— 只借道路由，不占 LVGL 池。
++// v10.4 首版在系统堆一次性分配 240*320*2 = 150KB 整屏缓冲，真机上最大
++// 连续空闲块给不出来，shot_request 必然 ERR SHOT。v10.4.1 改为环形分块
++// 流式：拦截显示刷新回调，把每个 20 行分块（送显前、字节序交换前的原生
++// 小端 RGB565）拷进 3 格环形槽（每格 240*24*2 = 11.5KB，共 34.5KB），
++// USB 任务边收边发——峰值内存只有旧方案的 1/4.4。
 +//
-+// 线程模型：USB 任务只置请求并等待；安装/卸载拦截与累积拷贝全部发生在
-+// LVGL 上下文（flush 回调 = 渲染任务；service = LVGL 定时器）。标志均为
-+// volatile 单写者，C3 单核无缓存一致性问题。
++// 线程模型（C3 单核，volatile 单写者标志即可）：
++//   USB 任务  = 消费者：请求挂钩 → 打印头 → 按序排空环形槽 → 判完成
++//   service() = LVGL 定时器上下文：换 flush 回调 + 整屏失效（cyber_clock
++//               的 tick() 每拍调用，无请求时只读一个标志）
++//   flush 回调 = 渲染任务（= 持有 LVGL 锁的上下文）：产出一格 → 置满标志；
++//               环满时小睡让 USB 任务排空（背压），整屏产完自动摘钩
++// 状态机 s_shot_state：0 空闲 / 1 已挂钩待首块 / 2 流式中 / 3 完成 /
++// 4 失败中止。任一侧失败置 s_shot_abort，对侧在等待点看到即退出并摘钩。
 +// ============================================================================
-+#define SHOT_TIMEOUT_MS 3000
-+#define SHOT_CHUNK      1024
++#define SHOT_SLOT_W     240                                // 面板宽（超出即失败）
++#define SHOT_SLOT_ROWS  24                                 // 每格容纳行数（绘制缓冲 20 行，留余量）
++#define SHOT_SLOTS      3
++#define SHOT_SLOT_BYTES ((size_t)SHOT_SLOT_W * SHOT_SLOT_ROWS * 2)   // 11520
++#define SHOT_RING_BYTES (SHOT_SLOT_BYTES * SHOT_SLOTS)               // 34560
++#define SHOT_USB_PIECE  2048                               // 单次 USB 写入上限
 +
-+static volatile bool s_shot_req;        // USB 任务 -> LVGL：请求截屏
-+static volatile int  s_shot_state;      // 0=空闲 1=采集中 2=就绪 3=失败/中止
-+static volatile bool s_shot_hooked;     // flush 拦截是否仍挂着（卸载确认用）
-+static uint8_t      *s_shot_buf;        // 输出缓冲（USB 任务分配/释放）
++static volatile bool s_shot_req;          // USB 任务 -> service：请求截屏
++static volatile int  s_shot_state;        // 见上方状态机
++static volatile bool s_shot_hooked;       // flush 拦截是否仍挂着
++static volatile bool s_shot_abort;        // 任一侧失败：通知对侧停止
++static uint8_t      *s_shot_ring;         // 环形缓冲（USB 任务分配/释放）
++static volatile int  s_slot_len[SHOT_SLOTS];
++static volatile bool s_slot_filled[SHOT_SLOTS];
++static volatile int  s_widx, s_ridx;      // 生产/消费计数（取模得槽号）
 +static lv_display_flush_cb_t s_orig_flush;
-+static int  s_shot_rows;
-+static int  s_shot_w, s_shot_h;
++static volatile int  s_shot_rows;
++static volatile int  s_shot_w, s_shot_h;
 +
-+// 拦截版 flush：先把本块像素（送显前、字节序交换前的原生小端 RGB565）
-+// 拷进累积缓冲，再交回 esp_lvgl_port 原回调。
++static void shot_unhook(lv_display_t *disp)
++{
++    lv_display_set_flush_cb(disp, s_orig_flush);
++    s_shot_hooked = false;
++}
++
++// 拦截版 flush：把本块像素拷进下一格空槽，再交回 esp_lvgl_port 原回调。
 +static void shot_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 +{
-+    if (s_shot_state == 1) {
++    if (s_shot_state == 1 || s_shot_state == 2) {
 +        int h = area->y2 - area->y1 + 1;
 +        int w = area->x2 - area->x1 + 1;
-+        if (s_shot_buf && area->x1 == 0 && w == s_shot_w &&
-+            area->y1 + h <= s_shot_h) {
-+            memcpy(s_shot_buf + (size_t)area->y1 * s_shot_w * 2, px_map,
-+                   (size_t)w * h * 2);
-+            s_shot_rows += h;
++        if (s_shot_ring && area->x1 == 0 && w == s_shot_w &&
++            area->y1 >= 0 && area->y1 + h <= s_shot_h &&
++            (size_t)w * h * 2 <= SHOT_SLOT_BYTES) {
++            int slot = s_widx % SHOT_SLOTS;
++            // 背压：环满时小睡等 USB 任务排空（上限 2s，超时/中止即失败）
++            int waited = 0;
++            while (s_slot_filled[slot] && !s_shot_abort) {
++                if (++waited > 200) { s_shot_state = 4; break; }
++                vTaskDelay(pdMS_TO_TICKS(10));
++            }
++            if (s_shot_abort) s_shot_state = 4;
++            if (s_shot_state == 1 || s_shot_state == 2) {
++                memcpy(s_shot_ring + (size_t)slot * SHOT_SLOT_BYTES, px_map,
++                       (size_t)w * h * 2);
++                s_slot_len[slot] = w * h * 2;
++                s_slot_filled[slot] = true;
++                s_widx++;
++                s_shot_rows += h;
++                if (s_shot_state == 1) s_shot_state = 2;   // 首块就绪，USB 可发头
++                if (s_shot_rows >= s_shot_h) {
++                    // 整屏产完：摘钩收工（消费者继续排空剩余满槽）
++                    shot_unhook(disp);
++                    s_shot_state = 3;
++                }
++            }
 +        }
-+        if (s_shot_rows >= s_shot_h) {
-+            // 整屏拼完：恢复原回调并发布就绪
-+            lv_display_set_flush_cb(disp, s_orig_flush);
-+            s_shot_hooked = false;
-+            s_shot_state = 2;
-+        }
++        // 非整宽分块（局部重绘）不采集：整屏失效后的重绘按全宽条带来，
++        // 这里只可能是采集前后的零星局部刷新，跳过即可。
 +    }
 +    s_orig_flush(disp, area, px_map);
 +}
 +
 +void usb_time_sync_snapshot_service(void)
 +{
-+    // 兜底卸载：采集超时等异常路径下 hook 可能仍挂着（state 已非 1），
-+    // 若不卸载，下一次截屏会把 shot_flush_cb 自己误存为"原回调"，
-+    // 完成时将造成无限递归。正常路径 state==1 时不动。
-+    if (s_shot_hooked && s_shot_state != 1) {
++    // 兜底卸载：失败/中止路径下钩子可能仍挂着，若不摘，下一次截屏会把
++    // shot_flush_cb 自己误存为"原回调"造成无限递归。活跃态(1/2)不动。
++    if (s_shot_hooked && s_shot_state != 1 && s_shot_state != 2) {
 +        lv_display_t *d = lv_display_get_default();
-+        if (d) lv_display_set_flush_cb(d, s_orig_flush);
-+        s_shot_hooked = false;
++        if (d) shot_unhook(d);
 +    }
 +    if (!s_shot_req) return;
 +    s_shot_req = false;
 +
 +    lv_display_t *disp = lv_display_get_default();
-+    if (!disp || !s_shot_buf) { s_shot_state = 3; return; }
++    if (!disp || !s_shot_ring) { s_shot_state = 4; return; }
 +
 +    s_shot_w = (int)lv_display_get_horizontal_resolution(disp);
 +    s_shot_h = (int)lv_display_get_vertical_resolution(disp);
++    if (s_shot_w > SHOT_SLOT_W || s_shot_w <= 0 || s_shot_h <= 0) {
++        s_shot_state = 4;
++        return;
++    }
 +
 +    s_orig_flush = disp->flush_cb;
 +    s_shot_rows = 0;
 +    s_shot_state = 1;
 +    s_shot_hooked = true;
 +    lv_display_set_flush_cb(disp, shot_flush_cb);
-+    // 整屏失效：下一轮渲染会按 20 行分块完整走一遍 flush，截屏由此完成
++    // 整屏失效：下一轮渲染会按全宽条带完整走一遍 flush，截屏由此完成
 +    lv_obj_invalidate(lv_screen_active());
 +}
 +
-+// USB 任务侧：发起请求并等待结果。成功时 *buf/*len 指向发送方随后要读的
-+// 缓冲（用完调 shot_release）。缓冲本身由本函数在系统堆上分配。
-+static bool shot_request(uint8_t **buf, size_t *len, int *w, int *h)
++// USB 任务侧：请求 → 打印头 → 排空环形槽。成功返回 true。
++static bool shot_stream(void)
 +{
-+    if (s_shot_state == 1) return false;             // 上一单还没结束
-+    s_shot_buf = malloc((size_t)240 * 320 * 2);
-+    if (!s_shot_buf) { s_shot_state = 3; return false; }
++    if (s_shot_state == 1 || s_shot_state == 2) return false;   // 上一单未结束
 +
++    uint8_t *ring = malloc(SHOT_RING_BYTES);                    // 34.5KB，一次成功
++    if (!ring) { s_shot_state = 4; return false; }
++    s_shot_ring = ring;
++    for (int i = 0; i < SHOT_SLOTS; i++) { s_slot_filled[i] = false; s_slot_len[i] = 0; }
++    s_widx = s_ridx = 0;
++    s_shot_abort = false;
 +    s_shot_state = 0;
-+    s_shot_req = true;                               // service() 在 LVGL 上下文消费
-+    for (int waited = 0; waited < SHOT_TIMEOUT_MS && s_shot_state == 0; waited += 10)
-+        vTaskDelay(pdMS_TO_TICKS(10));
-+    for (int waited = 0; waited < SHOT_TIMEOUT_MS && s_shot_state == 1; waited += 10)
-+        vTaskDelay(pdMS_TO_TICKS(10));
++    s_shot_req = true;                                          // service() 消费
 +
-+    if (s_shot_state == 2 && s_shot_buf) {
-+        *buf = s_shot_buf; *len = (size_t)s_shot_w * s_shot_h * 2;
-+        *w = s_shot_w; *h = s_shot_h;
-+        return true;
++    // 等 service 挂钩（LVGL 定时器节拍 100/250ms）
++    for (int t = 0; t < 300 && s_shot_state == 0; t += 10)
++        vTaskDelay(pdMS_TO_TICKS(10));
++    // 等首块数据（挂钩后一次刷新周期内即有）
++    for (int t = 0; t < 300 && s_shot_state == 1; t += 10)
++        vTaskDelay(pdMS_TO_TICKS(10));
++    if (s_shot_state != 2) goto fail;
++
++    {
++        int w = s_shot_w, h = s_shot_h;
++        size_t expected = (size_t)w * h * 2;
++        size_t sent = 0;
++        bool ok = true;
++
++        // 先全局静默日志再打印头，保证头与像素流之间不混入控制台字节
++        esp_log_level_set("*", ESP_LOG_NONE);
++        printf("FAP_SCREENSHOT_V1 %d %d RGB565LE %u\n", w, h, (unsigned)expected);
++        fflush(stdout);
++
++        while (sent < expected) {
++            int slot = s_ridx % SHOT_SLOTS;
++            int t = 0;
++            while (!s_slot_filled[slot]) {
++                if (s_shot_state == 4 || s_shot_state == 0) { ok = false; break; }
++                if (s_shot_state == 3 && s_ridx >= s_widx) { ok = false; break; }
++                if (++t > 300) { ok = false; break; }            // 3s 无新块
++                vTaskDelay(pdMS_TO_TICKS(10));
++            }
++            if (!ok) break;
++            const uint8_t *p = ring + (size_t)slot * SHOT_SLOT_BYTES;
++            size_t left = (size_t)s_slot_len[slot];
++            while (left > 0) {
++                size_t piece = left > SHOT_USB_PIECE ? SHOT_USB_PIECE : left;
++                int n = usb_serial_jtag_write_bytes(p, piece, pdMS_TO_TICKS(1000));
++                if (n <= 0) { ok = false; break; }               // 主机断开等
++                p += n; left -= (size_t)n; sent += (size_t)n;
++            }
++            s_slot_filled[slot] = false;                         // 归还生产者
++            s_ridx++;
++            if (!ok) break;
++        }
++        esp_log_level_set("*", ESP_LOG_INFO);
++        if (!ok) s_shot_abort = true;
++        // 等渲染侧摘钩（正常在最后一格产出时就已摘掉）
++        for (int t = 0; t < 150 && s_shot_hooked; t += 10)
++            vTaskDelay(pdMS_TO_TICKS(10));
++        free(ring);
++        s_shot_ring = NULL;
++        bool success = ok && sent == expected && s_shot_state == 3;
++        s_shot_state = 0;
++        s_shot_abort = false;
++        return success;
 +    }
-+    // 失败：先置 3 关门（flush 回调只认 1 才碰缓冲），避免 free 与
-+    // s_shot_buf=NULL 之间被渲染任务抢占读到悬垂指针；hook 由 service()
-+    // 兜底卸载（见函数头），这里只等一小会儿再释放。
-+    s_shot_state = 3;
-+    for (int waited = 0; waited < 500 && s_shot_hooked; waited += 10)
-+        vTaskDelay(pdMS_TO_TICKS(10));
-+    free(s_shot_buf); s_shot_buf = NULL;
-+    s_shot_state = 0;
-+    return false;
-+}
 +
-+// 发送完成后释放缓冲。若拦截仍挂着（异常路径），由 service 兜底卸载：
-+// 这里只负责 free —— 为安全起见等 hook 卸下后再释放。
-+static void shot_release(void)
-+{
-+    for (int waited = 0; waited < 500 && s_shot_hooked; waited += 10)
++fail:
++    s_shot_abort = true;
++    for (int t = 0; t < 150 && s_shot_hooked; t += 10)
 +        vTaskDelay(pdMS_TO_TICKS(10));
-+    free(s_shot_buf); s_shot_buf = NULL;
++    free(ring);
++    s_shot_ring = NULL;
 +    s_shot_state = 0;
++    s_shot_abort = false;
++    return false;
 +}
 +
 +static void handle_line(const char *line)
@@ -2729,25 +2805,7 @@ index 0000000..6932a40
 +    // ---- FAP_SCREENSHOT_V1：返回运行中的屏幕画面（纯观测，不改任何状态）----
 +    if (strncmp(buf, "FAP_SCREENSHOT_V1", 17) == 0 &&
 +        (buf[17] == '\0' || buf[17] == ' ')) {
-+        uint8_t *data; size_t len; int w, h;
-+        if (!shot_request(&data, &len, &w, &h)) {
-+            printf("ERR SHOT\n");
-+            return;
-+        }
-+        // 先全局静默日志再打印头，消除"头与像素流之间被日志插入"的窗口
-+        esp_log_level_set("*", ESP_LOG_NONE);
-+        printf("FAP_SCREENSHOT_V1 %d %d RGB565LE %u\n",
-+               w, h, (unsigned)len);
-+        fflush(stdout);
-+        const uint8_t *p = data; size_t left = len;
-+        while (left > 0) {
-+            size_t chunk = left > SHOT_CHUNK ? SHOT_CHUNK : left;
-+            int n = usb_serial_jtag_write_bytes(p, chunk, pdMS_TO_TICKS(1000));
-+            if (n <= 0) break;
-+            p += n; left -= n;
-+        }
-+        esp_log_level_set("*", ESP_LOG_INFO);
-+        shot_release();
++        if (!shot_stream()) printf("ERR SHOT\n");
 +        return;
 +    }
 +
