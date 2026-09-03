@@ -11,6 +11,7 @@
 | 文档 | 类型 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | [CHANGELOG.zh_CN.md](./CHANGELOG.zh_CN.md) | 变更记录 | authoritative | 用户可见行为、兼容性与发布流程历史 |
+| [TODO.zh_CN.md](./TODO.zh_CN.md) | 待办记录 | reference | 下一阶段任务清单与会话快速开始上下文 |
 | [brand-and-product.zh_CN.md](./brand-and-product.zh_CN.md) | 品牌与产品说明 | authoritative | 品牌与产品定位、官方入口、开源与授权、产品规格引用 |
 | [contribution/README.zh_CN.md](./contribution/README.zh_CN.md) | 协作规范索引 | authoritative | 通用协作规范（文档规范、提交与 PR 约定） |
 | [contribution/doc-conventions.zh_CN.md](./contribution/doc-conventions.zh_CN.md) | 文档规范 | authoritative | 按任务加载上下文、文档职责、写作维护和内容安全 |

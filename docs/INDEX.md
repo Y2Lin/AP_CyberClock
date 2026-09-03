@@ -10,6 +10,7 @@ Use this page to discover repository documentation. `authoritative` documents de
 | --- | --- | --- |
 | [README.md](README.md) | Project overview and capability contract | authoritative |
 | [CHANGELOG.md](CHANGELOG.md) | User-visible behavior, compatibility, and release history | authoritative |
+| [TODO.md](TODO.md) | Next-task backlog and session quick-start context | reference |
 | [brand-and-product.md](brand-and-product.md) | Brand, positioning, official links, and product facts | authoritative |
 | [contribution/README.md](contribution/README.md) | Contribution-document index | authoritative |
 | [contribution/doc-conventions.md](contribution/doc-conventions.md) | Documentation language, ownership, safety, and maintenance | authoritative |
