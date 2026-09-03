@@ -4,7 +4,7 @@
 
 # TODO - 下一阶段任务清单
 
-供下次开发会话快速接续的工作记录（创建于 2026-09-04）。当前状态快照：固件 v10.4.2（commit `855138f`）已发布并部署；社区提交（项目 138，revision 218）审核中；替换封面已备好，但审核期间无法上传。发布流程见 [development/publish-to-community.md](development/publish-to-community.md)。
+供下次开发会话快速接续的工作记录（创建于 2026-09-04）。当前状态快照：固件 v10.4.2（commit `855138f`）已发布并部署。
 
 ## 1. 重做 DOWN 精简模式（先出设计图，暂不写代码）
 
@@ -31,7 +31,3 @@
   6. 机器可读的失败原因（`ERR SHOT` 后接 `BUSY` / `MEM` / `HOOK` / `DATA` / `STALL` / `USB` / `SHORT`）让现场失败一眼可诊。
   7. 发布流程事实：截屏回执 24 小时有效；已有版本在审时新版本会被拒（“已有版本正在审核”）。
 - 注意：本仓库已有经验条目目录 `docs/experiences/`（见 [development/experience-notes.md](development/experience-notes.md)），需要划分哪些留在本仓库、哪些去 AP_Sound_Test 分支。
-
-## 发布跟进（暂被阻塞）
-
-- Revision 218 审核中。审核出结果（通过或驳回）后，用备好的替换封面（精确 3:4，SHA-256 前缀 `4d405e9d`）重新提交：仅换封面，其余字段与已批准内容完全一致。在此之前重提会被“已有版本正在审核”拒绝。

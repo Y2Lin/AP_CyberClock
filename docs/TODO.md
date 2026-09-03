@@ -31,7 +31,3 @@ Working record for the next development session (created 2026-09-04). Status sna
   6. Machine-readable failure reasons (`ERR SHOT` plus `BUSY` / `MEM` / `HOOK` / `DATA` / `STALL` / `USB` / `SHORT`) turn field failures into one-look diagnoses.
   7. Publishing flow facts: capture receipts are valid for 24 hours; a revision is rejected while another one is under review.
 - Note: this repository already keeps experience entries under `docs/experiences/` (see [development/experience-notes.md](development/experience-notes.md)); decide what belongs there versus the AP_Sound_Test branch.
-
-## Publication follow-up (blocked for now)
-
-- Revision 218 is under review. Once it is approved (or rejected), resubmit with the prepared replacement cover (exact 3:4, SHA-256 starting `4d405e9d`): only the cover changes; every other field stays as approved. The resubmit is rejected with "a revision is already under review" until then.
