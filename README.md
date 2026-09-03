@@ -40,7 +40,7 @@ boot -> [TIME SYNC page]  --OK: go to clock (BT turns off)-->  [Clock face]
 ### USB cable time sync (v5+, no Bluetooth)
 - Reuses the flashing USB cable via the ESP32-C3 USB Serial/JTAG port
 - Works on **any page**
-- Text command protocol: `PING` / `T <unix> <tz>` / `Q`
+- Text command protocol: `PING` / `T <unix> <tz>` / `Q` / `FAP_SCREENSHOT_V1` (runtime screen capture for the community publisher)
 - Browser direct connect (Chrome/Edge Web Serial) or `usb-sync.py`
 - DTR/RTS are held deasserted during the session, so closing the page no longer resets the device (the C3's built-in download-reset path reads those line transitions as a reset pulse; v9.1 fix)
 
@@ -150,6 +150,7 @@ idf.py flash monitor
 | `PING` | `PONG` |
 | `T 1788220800 8` | `OK TS=1788220800 TZ=8` |
 | `Q` | `{"ts":1788220800,"tz":28800,"synced":true}` |
+| `FAP_SCREENSHOT_V1` | `FAP_SCREENSHOT_V1 240 320 RGB565LE 153600` + binary frame (v10.4; observational only, no state change — required by the community publishing flow) |
 
 ## GitHub Pages deployment
 

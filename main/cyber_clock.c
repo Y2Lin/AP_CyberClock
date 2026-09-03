@@ -33,6 +33,7 @@
 #include "cyber_clock.h"
 #include "time_manager.h"
 #include "ble_time_sync.h"
+#include "usb_time_sync.h"
 #include "bsp_battery.h"
 #include "bsp_button.h"
 #include "bsp_display.h"
@@ -1208,6 +1209,11 @@ static void tick(lv_timer_t *timer)
         s_sync_pending = false;
         s_last_sec = -1;   // 强制立即刷新显示
     }
+
+    // FAP_SCREENSHOT_V1 运行时截屏服务（发布助手的连接证明协议）：
+    // USB 任务只置请求标志；钩子安装/卸载与缓冲累积都发生在本上下文
+    // （已持 bsp_lvgl 锁），无请求时仅读一个 volatile 标志即返回（v10.4）。
+    usb_time_sync_snapshot_service();
 
     // v9：同步成功后不再自动跳转——同步页就是"对时工作台"，停留本页持续
     // 显示 BT: LINKED 与 SYNCED 状态，由用户按 OK 手动进表盘（蓝牙随离页关闭）。

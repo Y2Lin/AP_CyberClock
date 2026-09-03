@@ -39,7 +39,7 @@
 ### USB 线对时（v5+，免蓝牙）
 - 复用刷固件的 USB 数据线，走 ESP32-C3 USB Serial/JTAG
 - **任意页面可用**，不依赖所在页面
-- 文本命令协议：`PING` / `T <unix> <tz>` / `Q`
+- 文本命令协议：`PING` / `T <unix> <tz>` / `Q` / `FAP_SCREENSHOT_V1`（社区发布助手用的运行时截屏）
 - 浏览器直连（Chrome/Edge Web Serial）或 `usb-sync.py` 命令行脚本
 - 会话期间保持 DTR/RTS 常低，**关闭页面不再触发设备重启**（C3 内置下载复位通路会把关口时的电平变化当复位脉冲；v9.1 修复）
 
@@ -151,6 +151,7 @@ idf.py flash monitor
 | `PING` | `PONG` |
 | `T 1788220800 8` | `OK TS=1788220800 TZ=8` |
 | `Q` | `{"ts":1788220800,"tz":28800,"synced":true}` |
+| `FAP_SCREENSHOT_V1` | `FAP_SCREENSHOT_V1 240 320 RGB565LE 153600` + 二进制帧（v10.4；纯观测不改任何状态——社区发布流程要求的连接证明） |
 
 ## GitHub Pages 自动部署
 
