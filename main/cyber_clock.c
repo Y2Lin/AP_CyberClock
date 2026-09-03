@@ -141,6 +141,8 @@ typedef enum {
 #define BRIGHT_MIN   10
 #define BRIGHT_MAX   100
 #define BRIGHT_STEP  10
+// 出厂默认亮度：不再拉满 100（满亮度下 OLED 偏刺眼且功耗高）
+#define BRIGHT_DEFAULT 80
 
 // NVS（与 time_manager 同命名空间，NVS 已在其 init 中完成 flash 初始化）
 #define NVS_NS_BRIGHT    "cyber_clk"
@@ -231,7 +233,7 @@ static lv_obj_t *s_bp_div;
 static lv_timer_t *s_timer;
 static app_page_t s_page = PAGE_COUNT_;   // 当前页面（初始哨兵值）
 static int s_menu_sel = 0;                // 菜单选中项
-static uint8_t s_brightness = BRIGHT_MAX; // 当前亮度（10..100）
+static uint8_t s_brightness = BRIGHT_DEFAULT; // 当前亮度（10..100，出厂默认 80）
 static int s_theme_idx = 0;
 static display_mode_t s_mode = MODE_FULL;
 static int s_last_sec = -1;
@@ -274,9 +276,16 @@ static lv_obj_t *make_label(lv_obj_t *parent, int x, int y,
 }
 
 // 右缘对齐标签：给定右边界 x2，标签占 [x, x2] 并右对齐文本
-static void label_right_align(lv_obj_t *l, int x, int x2)
+//
+// 注意：y 必须由调用方显式传入，不能用 lv_obj_get_y(l) 读回来。
+// lv_obj_get_y() 读的是 obj->coords，而 coords 要等下一次布局刷新才由 style 计算出来；
+// 本函数在 make_label() 之后紧接着调用，此刻 coords 仍是 lv_obj 构造时的初始值
+// (coords.y1 = parent->coords.y1 + pad_top)，换算出的 rel_y 恒为 0。
+// 早期写法 lv_obj_set_pos(l, x, lv_obj_get_y(l)) 会把 y 覆盖成 0，
+// 导致所有右对齐标签（电量%/星期/运行时长/电压）全部堆到页面顶端 y=0 处互相重叠。
+static void label_right_align(lv_obj_t *l, int x, int y, int x2)
 {
-    lv_obj_set_pos(l, x, lv_obj_get_y(l));
+    lv_obj_set_pos(l, x, y);
     lv_obj_set_width(l, x2 - x);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
 }
@@ -535,7 +544,7 @@ static void build_clock_page(void)
     lv_label_set_text(s_hdr_hex, "0x0000");
     s_hdr_batt = make_label(parent, 160, 14, &lv_font_montserrat_12, t->text_dim);
     lv_label_set_text(s_hdr_batt, "--%");
-    label_right_align(s_hdr_batt, 160, 220);
+    label_right_align(s_hdr_batt, 160, 14, 220);
 
     // ---- 故障切片条（爆发时显示，默认隐藏）----
     s_slice[0] = make_rect(parent, 0, 0, 40, 2, t->secondary);
@@ -589,7 +598,7 @@ static void build_clock_page(void)
     lv_label_set_text(s_date_label, "2026-01-01");
     s_weekday_label = make_label(parent, 160, 152, &lv_font_montserrat_16, t->primary);
     lv_label_set_text(s_weekday_label, "THU");
-    label_right_align(s_weekday_label, 160, 220);
+    label_right_align(s_weekday_label, 160, 152, 220);
 
     // ---- 频谱条 12 根：x=20+i*17，宽 9，底对齐 y202，高 3-17 随秒起伏 ----
     for (int i = 0; i < 12; i++) {
@@ -610,11 +619,15 @@ static void build_clock_page(void)
 
     // ---- 像素心形（两组：常规 9x7 @163,228 / 放大 12x10 @162,226）----
     {
+        // 小心形 9x7 @(163,228)：7 块按 h=1/1/2/1/1/1/1 叠成 y228-234，行必须连续。
+        // 旧版第 4 块写在 y232（应为 y231），y231 整行缺失，
+        // 心形腰部被一条 1px 透明缝横着切断 —— 视觉上就是"多余的横线 / 显示不全"。
         static const int sm[7][4] = {
             { 164, 228, 3, 1 }, { 168, 228, 3, 1 }, { 163, 229, 9, 2 },
-            { 164, 232, 7, 1 }, { 165, 233, 5, 1 }, { 166, 234, 3, 1 },
-            { 167, 235, 1, 1 },
+            { 164, 231, 7, 1 }, { 165, 232, 5, 1 }, { 166, 233, 3, 1 },
+            { 167, 234, 1, 1 },
         };
+        // 放大心形 12x10 @(162,226)：7 块按 h=2/2/3/2/1/1/1 叠成 y226-235，行连续无缝。
         static const int bg[7][4] = {
             { 163, 226, 4, 2 }, { 169, 226, 4, 2 }, { 162, 228, 12, 3 },
             { 164, 231, 8, 2 }, { 165, 233, 6, 1 }, { 166, 234, 4, 1 },
@@ -632,7 +645,7 @@ static void build_clock_page(void)
     // ---- 运行时长（心形右侧，右缘对齐 220）----
     s_uptime_label = make_label(parent, 174, 226, &lv_font_montserrat_14, t->text_dim);
     lv_label_set_text(s_uptime_label, "00:00");
-    label_right_align(s_uptime_label, 174, 220);
+    label_right_align(s_uptime_label, 174, 226, 220);
 
     // ---- 分割线 3（y252，通栏 200px）----
     s_div3 = make_rect(parent, 20, 252, 200, 1, t->hud_line);
@@ -651,7 +664,7 @@ static void build_clock_page(void)
     lv_label_set_text(s_batt_pct, "--%");
     s_batt_volt = make_label(parent, 176, 267, &lv_font_montserrat_12, t->text_dim);
     lv_label_set_text(s_batt_volt, "--.--V");
-    label_right_align(s_batt_volt, 176, 220);
+    label_right_align(s_batt_volt, 176, 267, 220);
 
     // ---- 底部十六进制流 y296 ----
     s_stream2 = make_label(parent, 20, 296, &lv_font_montserrat_12, t->text_dim);
@@ -1210,6 +1223,9 @@ static void tick(lv_timer_t *timer)
 
     if (tm.tm_sec != s_last_sec) {
         s_last_sec = tm.tm_sec;
+        // 把当前时间回写 NVS（内部 5 分钟节流）：下次断电重启时恢复值才不会
+        // 慢掉整个开机时长。放在这里是为了任何页面都能生效。
+        time_manager_periodic_save();
         if (s_page == PAGE_CLOCK) {
             update_time_display();
             // 每 5 秒刷新电池

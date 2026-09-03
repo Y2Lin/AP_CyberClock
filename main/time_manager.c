@@ -2,6 +2,7 @@
 #include "time_manager.h"
 #include "demo_radio.h"
 #include "esp_log.h"
+#include "esp_system.h"   // esp_reset_reason()
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -62,15 +63,24 @@ esp_err_t time_manager_init(void)
         nvs_close(h);
     }
 
-    // 重启检测：本机没有 RTC 电池，断电/深度睡眠后 esp_timer 归零。
-    // 若上次同步时刻"在未来"（last_sync_ms > 当前单调钟），说明发生了重启——
-    // 当前时间只是 NVS 恢复的粗略旧值，不可信。如实清除 synced 标志并持久化，
-    // 让 UI / BLE 通知 / USB Q 命令都显示未同步（v6 省电策略亦据此自动开广播等待对时）。
-    if (s_state.synced &&
-        s_state.last_sync_ms > esp_timer_get_time() / 1000) {
+    // 开机一律回到"未对时"。
+    //
+    // 本机没有给 RTC 供电的纽扣电池，断电/深度睡眠期间根本无法走时，
+    // 上面从 NVS 恢复出来的只是"上次保存那一刻"的旧值，偏差等于关机时长，
+    // 本质上不可信。所以无论复位源是上电、深度睡眠唤醒、看门狗还是软件重启，
+    // 这里都无条件清除 synced，交给 BLE / USB 重新校准。
+    //
+    // 旧实现靠 "last_sync_ms > esp_timer_get_time()" 判断单调钟是否回退来识别重启；
+    // 这条判据依赖 esp_timer 在复位后归零，在部分唤醒路径下并不成立，
+    // 于是界面继续显示 SYNCED 而时间其实是错的 —— 正是本次要修的现象。
+    // 只清 synced，sync_count 是历史统计，保留。
+    if (s_state.synced) {
+        ESP_LOGI(TAG, "复位源=%d esp_timer=%lldms：恢复的时间不可信，"
+                      "synced 已清除（等待重新同步）",
+                 (int)esp_reset_reason(),
+                 (long long)(esp_timer_get_time() / 1000));
         s_state.synced = false;
         persist_state();
-        ESP_LOGI(TAG, "检测到重启：恢复的时间不可信，synced 已清除（等待重新同步）");
     }
 
     s_initialized = true;
@@ -136,6 +146,31 @@ struct tm time_manager_get_local(void)
     struct tm tm;
     gmtime_r(&now, &tm);  // 用 gmtime_r 处理已加偏移的时间，避免系统 TZ 干扰
     return tm;
+}
+
+// 运行期间定期把当前时间回写 NVS（建议每秒调用一次，内部自行节流）。
+//
+// NVS_KEY_LAST 过去只在 set_unix_utc() 里写一次，后果是：连续开机 N 小时后断电，
+// 下次启动恢复出来的时间整整慢 N 小时 —— 这是"关机再打开时间就不对了"的主要放大项。
+// 按 5 分钟节奏回写后，断电恢复值的偏差被压到 5 分钟以内。
+// 不做每分钟是为了控制 flash 擦写次数：NVS 有磨损均衡，但每天 288 次比 1440 次稳妥得多。
+void time_manager_periodic_save(void)
+{
+    if (!s_state.synced) return;   // 未同步时时间本就不可信，不值得写
+
+    struct tm tm = time_manager_get_local();
+    if (tm.tm_sec != 0 || tm.tm_min % 5 != 0) return;
+
+    static int last_min = -1;
+    if (tm.tm_min == last_min) return;   // 同一分钟内不重复写
+    last_min = tm.tm_min;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i64(h, NVS_KEY_LAST, (int64_t)time_manager_get_unix_utc());
+        nvs_commit(h);
+        nvs_close(h);
+    }
 }
 
 time_manager_state_t time_manager_get_state(void)

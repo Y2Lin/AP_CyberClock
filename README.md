@@ -52,10 +52,11 @@ boot -> [TIME SYNC page]  --OK: go to clock (BT turns off)-->  [Clock face]
 
 ### Brightness (v8)
 - UP/DOWN adjusts backlight in 10% steps (10–100%) on the Brightness page
-- Persisted to NVS, restored on boot
+- Factory default 80% (v10.1); user adjustments persist to NVS and are restored on boot
 
 ### Misc
-- Time and timezone persisted to NVS, restored on boot (coarse)
+- Time and timezone persisted to NVS and rewritten every 5 minutes while running, so a power cut costs at most 5 minutes of drift (v10.1)
+- The device has no RTC backup battery: after any reset it always comes back unsynced and waits for a fresh BLE/USB calibration (v10.1, every reset source)
 - LVGL thread safety: callbacks only set flags; UI refresh happens in the LVGL timer context
 
 ## Keys (per page, v8+)

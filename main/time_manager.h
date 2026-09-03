@@ -33,6 +33,10 @@ struct tm time_manager_get_local(void);
 // 获取当前 UTC Unix 时间戳（秒）。
 time_t time_manager_get_unix_utc(void);
 
+// 运行期间定期把当前时间回写 NVS，缩小断电后恢复值的偏差。
+// 可放心每秒调用：内部按 5 分钟节流；未同步时直接返回，不产生 flash 写入。
+void time_manager_periodic_save(void);
+
 // 获取当前状态的只读快照。
 time_manager_state_t time_manager_get_state(void);
 

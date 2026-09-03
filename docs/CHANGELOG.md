@@ -6,6 +6,7 @@
 
 ## Unreleased
 
+- Firmware v10.1 (display fixes + two low-priority asks): right-column labels (battery %, weekday, uptime, voltage) no longer collapse onto row 0 — `lv_obj_get_y()` returns placeholder coords before the first layout pass, so y is now passed explicitly; the small pixel heart had its y231 row missing, leaving a 1px transparent seam across the waist (the "incomplete heart + stray horizontal line"); factory default brightness is now 80 instead of 100; after any reset the device always comes back unsynced (the old monotonic-clock-rewind check failed on some wake paths, so a power cycle kept showing SYNCED with a frozen time), and the current time is now flushed to NVS every 5 minutes while running, capping power-loss drift at 5 minutes instead of the whole uptime; `sdkconfig.defaults` raises the LVGL pool from 32KB to 64KB (the v10 white-screen fix previously lived only in the gitignored local `sdkconfig`, so CI builds still white-screened). Prebuilt binaries and the source patch are updated to match.
 - Made mini-program BLE install compatibility a template-level invariant: fixed
   protected `cardid`/Recovery partitions, retained the five-second UP-key
   Recovery boot hook, and added CI validation for merged-image structure,
