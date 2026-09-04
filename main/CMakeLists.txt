@@ -14,6 +14,7 @@ idf_component_register(
          "ble_time_sync.c"
          "usb_time_sync.c"
          "cyber_clock.c"
+         "battery_gauge.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash esp_driver_usb_serial_jtag
 )

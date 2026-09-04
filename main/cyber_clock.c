@@ -35,6 +35,7 @@
 #include "ble_time_sync.h"
 #include "usb_time_sync.h"
 #include "bsp_battery.h"
+#include "battery_gauge.h"
 #include "bsp_button.h"
 #include "bsp_display.h"
 #include "esp_log.h"
@@ -201,6 +202,19 @@ static lv_obj_t *s_batt_pct;               // 电池百分比
 static lv_obj_t *s_batt_volt;              // 电池电压（右缘对齐）
 static lv_obj_t *s_stream2;                // 底部十六进制流 >> 0x??????
 
+// ---- v10.5 精简模式控件（定稿方案 C：HH:MM 大字 + 秒进度线 + 日期行 + 低电红点）----
+// 完整/精简两组控件各放进一个全屏零内边距的层容器，DOWN 切换时整层显隐，
+// 互不干扰（比逐控件增删 HIDDEN 标志干净，也不必重排完整模式布局）。
+static lv_obj_t *s_full_box;             // 完整模式控件层
+static lv_obj_t *s_min_box;              // 精简模式控件层
+static lv_obj_t *s_min_time;             // HH:MM 主字（48px，水平居中）
+static lv_obj_t *s_min_time_ghost1;      // 双色差残影 1（整体左偏 4px）
+static lv_obj_t *s_min_time_ghost2;      // 双色差残影 2（右偏 6px 下移 3px）
+static lv_obj_t *s_min_track;            // 秒进度残影轨道（112px 居中，低透明次色）
+static lv_obj_t *s_min_fill;             // 秒进度主线（112px 满宽，按本分钟已过秒数填充）
+static lv_obj_t *s_min_date;             // 日期行 YYYY-MM-DD  WEEKDAY（全行统一暗色）
+static lv_obj_t *s_min_dot;              // 低电量红点（8x8 圆，仅 SOC<20% 出现）
+
 // ---- 表盘动效状态（100ms tick 驱动）----
 static int s_glitch_ticks = 0;             // 故障爆发剩余 tick 数（0=常态）
 static int s_beat_phase = 4;               // 心跳相位（0..3 活跃，>=4 静止）
@@ -244,6 +258,19 @@ static display_mode_t s_mode = MODE_FULL;
 static int s_last_sec = -1;
 static int s_batt_soc = -1;
 static int s_batt_mv = 0;
+// v10.4.3 电量校准器：电压→SOC 重映射（OCV 表）+ 中值滤波 + 显示迟滞。
+// 芯片 SOC 系统性偏高（CW2017 未写电芯 profile），不再采信（见 battery_gauge.h）。
+static battery_gauge_t s_gauge;
+static bool s_gauge_ready = false;
+
+// 惰性初始化校准器（首次用到电池读数时执行一次）
+static void battery_ensure_gauge(void)
+{
+    if (!s_gauge_ready) {
+        battery_gauge_init(&s_gauge);
+        s_gauge_ready = true;
+    }
+}
 static int64_t s_enter_time;
 static bool s_ble_started = false;
 static volatile bool s_sync_pending;      // BLE 同步事件标志（跨任务传递）
@@ -297,6 +324,21 @@ static void label_right_align(lv_obj_t *l, int x, int y, int x2)
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
 }
 
+// v10.5 控件层容器：全屏、原点 (0,0)、零内边距、无边框、透明背景、不可滚动。
+// 子控件沿用页面绝对坐标（层不产生任何偏移），隐藏层即整体隐藏其全部子控件。
+static lv_obj_t *make_layer(lv_obj_t *parent)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_pos(box, 0, 0);
+    lv_obj_set_size(box, 240, 320);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_set_style_border_width(box, 0, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+    lv_obj_set_scrollbar_mode(box, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    return box;
+}
+
 // 确定性伪随机（LCG）：种子由触发时刻的秒数决定，同秒重现同图案
 static uint32_t rnd_next(void)
 {
@@ -319,6 +361,23 @@ static inline bool theme_is_eink(void)
 static inline bool mode_is_full(void)
 {
     return s_mode == MODE_FULL;
+}
+
+// v10.5 显示模式应用：完整/精简两组控件层整层互换。
+// 精简层只有 HH:MM 大字（+残影）、紧贴主字的秒进度线、日期行与低电红点；
+// 其余一切元素都在完整层。故障色条另守旧规则：精简或墨水屏下保持隐藏
+// （层虽已整体隐藏，恢复完整模式时色条自身的显隐状态也要正确）。
+static void mode_apply(void)
+{
+    bool full = mode_is_full();
+    (full ? lv_obj_clear_flag : lv_obj_add_flag)(s_full_box, LV_OBJ_FLAG_HIDDEN);
+    (!full ? lv_obj_clear_flag : lv_obj_add_flag)(s_min_box, LV_OBJ_FLAG_HIDDEN);
+
+    bool eink = theme_is_eink();
+    for (int i = 0; i < 3; i++) {
+        if (!full || eink) lv_obj_add_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
+        else               lv_obj_clear_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // ============================================================================
@@ -440,14 +499,15 @@ static void brightness_apply(void)
 static void battery_update(void)
 {
     if (s_batt_soc < 0) {
-        // 首次读取
-        int soc = bsp_battery_soc();
+        // 首次读取：走校准器（电压→OCV 表→滤波迟滞），不再直读芯片 SOC
+        battery_ensure_gauge();
         int mv = bsp_battery_mv();
+        int soc = battery_gauge_feed(&s_gauge, mv);
         if (soc >= 0) {
             s_batt_soc = soc;
             s_batt_mv = (mv >= 0) ? mv : 3700;
         } else {
-            s_batt_soc = 50;  // 默认值
+            s_batt_soc = 50;  // 无电量计/读数全无效时的默认值
             s_batt_mv = 3700;
         }
     }
@@ -460,6 +520,9 @@ static void battery_update(void)
     // 分段电池：10 段，lit = ceil(soc/10)（87% → 9 段点亮）
     uint32_t batt_color = (soc < 20) ? t->warn : t->battery_ok;
     int lit = (soc + 9) / 10;
+
+    // v10.5 精简模式低电红点：低于 20% 才出现（慢闪在 update_time_display）
+    ((soc < 20) ? lv_obj_clear_flag : lv_obj_add_flag)(s_min_dot, LV_OBJ_FLAG_HIDDEN);
     lv_opa_t lit_opa = theme_is_eink() ? LV_OPA_50 : LV_OPA_90;
     for (int i = 0; i < 10; i++) {
         lv_obj_set_style_bg_color(s_batt_seg[i], lv_color_hex(batt_color), 0);
@@ -484,15 +547,16 @@ static void battery_update(void)
     set_text_color(s_batt_volt, t->text_dim);
 }
 
-// 每 5 秒刷新一次电池读数（避免频繁 I2C 阻塞）
+// 每 5 秒刷新一次电池读数（避免频繁 I2C 阻塞）。
+// v10.4.3：只读 VCELL 电压喂校准器换算百分比；CW2017 的 SOC 寄存器跑默认
+// 通用 Li-Po 曲线、系统性偏高（3.92V→73%），已不再用于显示。
 static void battery_refresh(void)
 {
-    int soc = bsp_battery_soc();
+    battery_ensure_gauge();
     int mv = bsp_battery_mv();
-    if (soc >= 0) {
-        s_batt_soc = soc;
-        s_batt_mv = (mv >= 0) ? mv : s_batt_mv;
-    }
+    int soc = battery_gauge_feed(&s_gauge, mv);
+    if (soc >= 0) s_batt_soc = soc;
+    if (mv >= 0) s_batt_mv = mv;
     battery_update();
 }
 
@@ -501,8 +565,13 @@ static void battery_refresh(void)
 // ============================================================================
 static void build_clock_page(void)
 {
-    lv_obj_t *parent = s_pg[PAGE_CLOCK];
+    lv_obj_t *page = s_pg[PAGE_CLOCK];
     const cyber_theme_t *t = &THEMES[s_theme_idx];
+
+    // v10.5：完整模式控件全部挂到独立层容器，DOWN 切换时整层显隐。
+    // parent 指向 s_full_box，下方所有绝对坐标与旧版一致（层零偏移）。
+    s_full_box = make_layer(page);
+    lv_obj_t *parent = s_full_box;
 
     // ---- 内嵌外框（3px 内缩，1px 描边）----
     s_frame = make_rect(parent, 3, 3, 234, 314, t->hud_line);
@@ -676,6 +745,61 @@ static void build_clock_page(void)
     // ---- 底部十六进制流 y296 ----
     s_stream2 = make_label(parent, 20, 296, &lv_font_montserrat_12, t->text_dim);
     lv_label_set_text(s_stream2, ">> 0x000000");
+
+    // ====================================================================
+    // v10.5 精简模式层（定稿方案 C）：只显示 HH:MM 大字 + 紧贴其下的秒
+    // 进度线 + 日期行，外加低于 20% 才出现的低电量红点；其余一切元素
+    // （外框/刻度/顶栏/频谱/终端行/心形/电池条/底流）都在完整层，不出现在本层。
+    // 布局对应设计图 v4（内容整体上移、星期并入日期行且全行统一暗色）。
+    // ====================================================================
+    s_min_box = make_layer(page);
+    {
+        lv_obj_t *mp = s_min_box;
+
+        // 时间组：主字 48px 居中（y=100），双色差残影保留（偏移同完整模式：
+        // 残影 1 整体左偏 4px、残影 2 右偏 6px 下移 3px；墨水屏由 apply_theme 隐藏）
+        s_min_time_ghost1 = make_label(mp, -4, 100, &lv_font_montserrat_48, t->secondary);
+        lv_obj_set_style_text_opa(s_min_time_ghost1, LV_OPA_30, 0);
+        lv_label_set_text(s_min_time_ghost1, "00:00");
+        s_min_time_ghost2 = make_label(mp, 6, 103, &lv_font_montserrat_48, t->secondary);
+        lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
+        lv_label_set_text(s_min_time_ghost2, "00:00");
+        s_min_time = make_label(mp, 0, 100, &lv_font_montserrat_48, t->primary);
+        lv_obj_set_width(s_min_time, 240);
+        lv_obj_set_style_text_align(s_min_time, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(s_min_time, "00:00");
+        // 残影同样居中：宽度 240 + 居中对齐，坐标偏移即整体平移
+        lv_obj_set_width(s_min_time_ghost1, 240);
+        lv_obj_set_style_text_align(s_min_time_ghost1, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(s_min_time_ghost2, 240);
+        lv_obj_set_style_text_align(s_min_time_ghost2, LV_TEXT_ALIGN_CENTER, 0);
+
+        // 秒进度下划线（v4.4 定稿）：112px 居中（大字宽度的 4/5），与主字
+        // 底保持 8px 呼吸间距（主线 y=149）；无末端光标。残影轨道 112x2
+        // 低透明次色，比主线右错 2px 低 1px（双色差残影语言）；主线 112x2（70% 亮度）
+        // 主色按本分钟已过秒数填充。真机可按字形度量微调。
+        s_min_track = make_rect(mp, 66, 150, 112, 2, t->secondary);
+        lv_obj_set_style_bg_opa(s_min_track, LV_OPA_20, 0);
+        s_min_fill = make_rect(mp, 64, 149, 1, 2, t->primary);
+        // 主线 70% 亮度（创作者定稿：全亮主色在深色主题下过亮；墨水屏
+        // 对比度低，apply_theme 提到 80% 保可见）
+        lv_obj_set_style_bg_opa(s_min_fill, LV_OPA_70, 0);
+
+        // 日期行 y196：YYYY-MM-DD  WEEKDAY，16px 全行统一暗色（定稿：星期
+        // 不再主色点亮）。分隔用双空格——montserrat 无中点(U+00B7)字形
+        s_min_date = make_label(mp, 0, 196, &lv_font_montserrat_16, t->text_dim);
+        lv_obj_set_width(s_min_date, 240);
+        lv_obj_set_style_text_align(s_min_date, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(s_min_date, "2026-01-01  THU");
+
+        // 低电量红点：右上角 8x8 圆，仅 SOC<20% 显示（显隐由 battery_update
+        // 控制，慢闪由 update_time_display 控制；墨水屏常亮不闪）
+        s_min_dot = make_rect(mp, 212, 18, 8, 8, t->warn);
+        lv_obj_set_style_radius(s_min_dot, 4, 0);
+
+        // 开机默认完整模式：精简层整体隐藏
+        lv_obj_add_flag(s_min_box, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // ============================================================================
@@ -1010,6 +1134,30 @@ static void apply_theme(void)
     lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
     set_text_color(s_stream2, t->text_dim);
 
+    // ---- v10.5 精简模式组（残影墨水屏隐藏；主字柔光晕仅非墨水屏）----
+    set_text_color(s_min_time, t->primary);
+    set_text_color(s_min_time_ghost1, t->secondary);
+    set_text_color(s_min_time_ghost2, t->secondary);
+    set_text_color(s_min_date, t->text_dim);
+    lv_obj_set_style_text_opa(s_min_time_ghost1, LV_OPA_30, 0);
+    lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
+    (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_min_time_ghost1, LV_OBJ_FLAG_HIDDEN);
+    (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_min_time_ghost2, LV_OBJ_FLAG_HIDDEN);
+    // 秒进度下划线：残影轨道低透明次色（墨水屏稍高保可见）、主线与光标主色
+    lv_obj_set_style_bg_color(s_min_track, lv_color_hex(t->secondary), 0);
+    lv_obj_set_style_bg_opa(s_min_track, eink ? LV_OPA_30 : LV_OPA_20, 0);
+    lv_obj_set_style_bg_color(s_min_fill, lv_color_hex(t->primary), 0);
+    lv_obj_set_style_bg_opa(s_min_fill, eink ? LV_OPA_80 : LV_OPA_70, 0);
+    lv_obj_set_style_bg_color(s_min_dot, lv_color_hex(t->warn), 0);
+    // 主字柔光晕（"发光保留"的固件形态：label 对象柔阴影呼吸；墨水屏关闭）
+    if (eink) {
+        lv_obj_set_style_shadow_width(s_min_time, 0, 0);
+    } else {
+        lv_obj_set_style_shadow_width(s_min_time, 14, 0);
+        lv_obj_set_style_shadow_spread(s_min_time, 2, 0);
+        lv_obj_set_style_shadow_color(s_min_time, lv_color_hex(t->primary), 0);
+    }
+
     // ---- 同步页 ----
     set_text_color(s_sp_title, t->primary);
     set_text_color(s_sp_time, t->primary);
@@ -1057,6 +1205,34 @@ static void update_time_display(void)
     lv_label_set_text(s_time_label, buf);
     lv_label_set_text(s_time_ghost1, buf);
     lv_label_set_text(s_time_ghost2, buf);
+
+    // ---- v10.5 精简模式组同步刷新（层隐藏时更新隐藏控件，无渲染开销）----
+    lv_label_set_text(s_min_time, buf);
+    lv_label_set_text(s_min_time_ghost1, buf);
+    lv_label_set_text(s_min_time_ghost2, buf);
+    // 未同步呼吸闪烁：与完整模式同一策略（奇数秒半透明，此刻时间不可信）
+    lv_obj_set_style_text_opa(s_min_time,
+        (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
+    // 主字柔光晕呼吸（发光保留的定稿决定；墨水屏无光晕不呼吸）
+    if (!theme_is_eink()) {
+        lv_obj_set_style_shadow_opa(s_min_time,
+            (tm.tm_sec % 2) ? LV_OPA_30 : LV_OPA_50, 0);
+    }
+    // 秒进度：主线按本分钟已过秒数填充（112px 满宽）
+    {
+        int fw = ((tm.tm_sec + 1) * 112) / 60;
+        if (fw < 1) fw = 1;
+        if (fw > 112) fw = 112;
+        lv_obj_set_width(s_min_fill, fw);
+    }
+    // 日期行：YYYY-MM-DD  WEEKDAY（定稿：星期并入日期行，全行统一暗色；
+    // 双空格分隔——montserrat 字库无中点字形）
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d  %s",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, WEEKDAYS[tm.tm_wday]);
+    lv_label_set_text(s_min_date, buf);
+    // 低电量红点慢闪（1s 相位二态近似设计图的呼吸；墨水屏常亮）
+    lv_obj_set_style_bg_opa(s_min_dot,
+        (!theme_is_eink() && (tm.tm_sec % 2)) ? LV_OPA_40 : LV_OPA_COVER, 0);
 
     // 未同步时时间主文字呼吸闪烁（奇数秒半透明）：此刻显示的是 NVS 恢复的
     // 粗略旧值，不可信；闪烁提醒用户需要对时（v7 保留，墨水屏同样适用）
@@ -1363,6 +1539,16 @@ void demo_cyber_clock_exit(void)
     memset(s_batt_seg, 0, sizeof(s_batt_seg));
     s_batt_pct = NULL;
     s_batt_volt = NULL;
+    // v10.5 精简模式组（含两层容器）
+    s_full_box = NULL;
+    s_min_box = NULL;
+    s_min_time = NULL;
+    s_min_time_ghost1 = NULL;
+    s_min_time_ghost2 = NULL;
+    s_min_track = NULL;
+    s_min_fill = NULL;
+    s_min_date = NULL;
+    s_min_dot = NULL;
     s_glitch_ticks = 0;
     s_beat_phase = 4;
 
@@ -1431,22 +1617,12 @@ void demo_cyber_clock_key(bsp_btn_t btn, bsp_btn_ev_t ev)
             ESP_LOGI(TAG, "切换主题: %d", s_theme_idx);
             apply_theme();
         } else if (btn == BSP_BTN_DOWN) {
-            // 切换显示模式：完整 / 精简（隐藏顶栏流、频谱、底流、故障色条）
+            // 切换显示模式：完整 / 精简（v10.5：两组控件层整层互换）
             s_mode = (s_mode + 1) % MODE_COUNT;
             ESP_LOGI(TAG, "切换模式: %d", s_mode);
-            bool hide = (s_mode == MODE_MINIMAL);
-            for (int i = 0; i < 12; i++) {
-                (hide ? lv_obj_add_flag : lv_obj_clear_flag)(s_spec[i], LV_OBJ_FLAG_HIDDEN);
-            }
-            for (int i = 0; i < 3; i++) {
-                // 精简模式隐藏故障色条；恢复时墨水屏仍保持隐藏
-                if (hide || theme_is_eink())
-                    lv_obj_add_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
-                else
-                    lv_obj_clear_flag(s_gbar[i], LV_OBJ_FLAG_HIDDEN);
-            }
-            (hide ? lv_obj_add_flag : lv_obj_clear_flag)(s_hdr_hex, LV_OBJ_FLAG_HIDDEN);
-            (hide ? lv_obj_add_flag : lv_obj_clear_flag)(s_stream2, LV_OBJ_FLAG_HIDDEN);
+            mode_apply();
+            update_time_display();
+            battery_update();   // 精简模式低电红点状态立即正确
         }
         break;
 
