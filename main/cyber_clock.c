@@ -339,6 +339,20 @@ static lv_obj_t *make_layer(lv_obj_t *parent)
     return box;
 }
 
+// v10.5.1 精简主字居中：label 保持内容自适应宽度，按文本实际宽手动居中。
+// 每次刷新文本后调用；lv_obj_update_layout() 同步布局取到新宽度
+// （每秒一次、对象树很小，开销可接受）。
+// 不用"width=240 + 居中对齐"的原因：主字柔光晕是对象盒阴影（LVGL label
+// 无按字形的文字阴影），阴影画在包围盒边缘外扩处——全宽盒会把光晕变成
+// 上下两条 240px 横向贯穿光带（真机实测缺陷）；自适应宽度让阴影紧贴
+// 文字，光晕只剩文字宽度的一小段。
+static void min_time_recenter(void)
+{
+    if (!s_min_time) return;
+    lv_obj_update_layout(s_min_time);
+    lv_obj_set_x(s_min_time, (240 - lv_obj_get_width(s_min_time)) / 2);
+}
+
 // 确定性伪随机（LCG）：种子由触发时刻的秒数决定，同秒重现同图案
 static uint32_t rnd_next(void)
 {
@@ -764,11 +778,15 @@ static void build_clock_page(void)
         s_min_time_ghost2 = make_label(mp, 6, 103, &lv_font_montserrat_48, t->secondary);
         lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
         lv_label_set_text(s_min_time_ghost2, "00:00");
+        // v10.5.1：主字不占满 240px，保持内容自适应宽度，刷新后手动居中
+        // （min_time_recenter）——柔光晕盒阴影得以紧贴文字，不再贯穿屏幕。
+        // radius 作用于阴影形状（label 背景透明、圆角本身不可见），
+        // 让上下光带边缘弧化更柔和。
         s_min_time = make_label(mp, 0, 100, &lv_font_montserrat_48, t->primary);
-        lv_obj_set_width(s_min_time, 240);
-        lv_obj_set_style_text_align(s_min_time, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_text(s_min_time, "00:00");
-        // 残影同样居中：宽度 240 + 居中对齐，坐标偏移即整体平移
+        lv_obj_set_style_radius(s_min_time, 24, 0);
+        min_time_recenter();
+        // 残影无阴影，仍用"宽度 240 + 居中对齐"，坐标偏移即整体平移
         lv_obj_set_width(s_min_time_ghost1, 240);
         lv_obj_set_style_text_align(s_min_time_ghost1, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(s_min_time_ghost2, 240);
@@ -1149,7 +1167,10 @@ static void apply_theme(void)
     lv_obj_set_style_bg_color(s_min_fill, lv_color_hex(t->primary), 0);
     lv_obj_set_style_bg_opa(s_min_fill, eink ? LV_OPA_80 : LV_OPA_70, 0);
     lv_obj_set_style_bg_color(s_min_dot, lv_color_hex(t->warn), 0);
-    // 主字柔光晕（"发光保留"的固件形态：label 对象柔阴影呼吸；墨水屏关闭）
+    // 主字柔光晕（"发光保留"的固件形态）：对象盒阴影呼吸；墨水屏关闭。
+    // v10.5.1 修复：主字已改为内容自适应宽度（不再 width=240），阴影包围
+    // 盒紧贴文字——旧全宽盒的阴影是真机上时间上下各一条 240px 横向贯穿
+    // 光带的直接原因。阴影形状圆角在创建时设置（radius 24）。
     if (eink) {
         lv_obj_set_style_shadow_width(s_min_time, 0, 0);
     } else {
@@ -1208,6 +1229,9 @@ static void update_time_display(void)
 
     // ---- v10.5 精简模式组同步刷新（层隐藏时更新隐藏控件，无渲染开销）----
     lv_label_set_text(s_min_time, buf);
+    // v10.5.1：主字内容自适应宽度，文本变化后重新按实际宽度居中
+    //（数字字形宽度有差异，如"1"窄于"2"）
+    min_time_recenter();
     lv_label_set_text(s_min_time_ghost1, buf);
     lv_label_set_text(s_min_time_ghost2, buf);
     // 未同步呼吸闪烁：与完整模式同一策略（奇数秒半透明，此刻时间不可信）
