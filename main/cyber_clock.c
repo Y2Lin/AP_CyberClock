@@ -53,6 +53,11 @@ static const char *TAG = "cyber_clk";
 // LVGL 透明度预置档只有 10 的整数倍：残影 2 的 0.15 档自定义（38/255）
 #define GHOST2_OPA ((lv_opa_t)38)
 
+// v10.5.2 文字光晕层数：LVGL label 无按字形阴影（盒阴影两次翻车：全宽盒
+// =贯穿光带、窄盒=椭圆光圈），改用多层微偏移同文本叠加模拟字形周围的
+// 渐变光（CSS text-shadow blur 的近似形态）
+#define MIN_GLOW_N 12
+
 // ============================================================================
 // 配色主题
 // ============================================================================
@@ -214,6 +219,16 @@ static lv_obj_t *s_min_track;            // 秒进度残影轨道（112px 居中
 static lv_obj_t *s_min_fill;             // 秒进度主线（112px 满宽，按本分钟已过秒数填充）
 static lv_obj_t *s_min_date;             // 日期行 YYYY-MM-DD  WEEKDAY（全行统一暗色）
 static lv_obj_t *s_min_dot;              // 低电量红点（8x8 圆，仅 SOC<20% 出现）
+static lv_obj_t *s_min_glow[MIN_GLOW_N]; // 主字文字光晕层（微偏移同文本低透明叠加）
+
+// 光晕层几何：{dx, dy, opa/255}。对角内环最亮紧贴字形、十字内环次之、
+// 十字外环最淡负责铺开范围；主字盖在最上层，露出的只有字形边缘 1-3px
+// 的渐变光带。opa 数值真机可再调。
+static const int8_t s_min_glow_geo[MIN_GLOW_N][3] = {
+    { -1, -1, 90 }, { 1, -1, 90 }, { -1, 1, 90 }, {  1,  1, 90 }, // 对角内环
+    {  0, -2, 70 }, { 0,  2, 70 }, { -2,  0, 70 }, {  2,  0, 70 }, // 十字内环
+    {  0, -3, 45 }, { 0,  3, 45 }, { -3,  0, 45 }, {  3,  0, 45 }, // 十字外环
+};
 
 // ---- 表盘动效状态（100ms tick 驱动）----
 static int s_glitch_ticks = 0;             // 故障爆发剩余 tick 数（0=常态）
@@ -339,18 +354,20 @@ static lv_obj_t *make_layer(lv_obj_t *parent)
     return box;
 }
 
-// v10.5.1 精简主字居中：label 保持内容自适应宽度，按文本实际宽手动居中。
-// 每次刷新文本后调用；lv_obj_update_layout() 同步布局取到新宽度
-// （每秒一次、对象树很小，开销可接受）。
-// 不用"width=240 + 居中对齐"的原因：主字柔光晕是对象盒阴影（LVGL label
-// 无按字形的文字阴影），阴影画在包围盒边缘外扩处——全宽盒会把光晕变成
-// 上下两条 240px 横向贯穿光带（真机实测缺陷）；自适应宽度让阴影紧贴
-// 文字，光晕只剩文字宽度的一小段。
+// v10.5 精简主字居中：label 保持内容自适应宽度，按文本实际宽手动居中，
+// 光晕层跟随主字平移（各自叠上几何偏移）。每次刷新文本后调用；
+// lv_obj_update_layout() 同步布局取到新宽度（每秒一次、对象树小，可接受）。
 static void min_time_recenter(void)
 {
     if (!s_min_time) return;
     lv_obj_update_layout(s_min_time);
-    lv_obj_set_x(s_min_time, (240 - lv_obj_get_width(s_min_time)) / 2);
+    lv_coord_t x = (240 - lv_obj_get_width(s_min_time)) / 2;
+    lv_obj_set_x(s_min_time, x);
+    for (int i = 0; i < MIN_GLOW_N; i++) {
+        if (s_min_glow[i]) {
+            lv_obj_set_x(s_min_glow[i], x + s_min_glow_geo[i][0]);
+        }
+    }
 }
 
 // 确定性伪随机（LCG）：种子由触发时刻的秒数决定，同秒重现同图案
@@ -778,13 +795,23 @@ static void build_clock_page(void)
         s_min_time_ghost2 = make_label(mp, 6, 103, &lv_font_montserrat_48, t->secondary);
         lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
         lv_label_set_text(s_min_time_ghost2, "00:00");
-        // v10.5.1：主字不占满 240px，保持内容自适应宽度，刷新后手动居中
-        // （min_time_recenter）——柔光晕盒阴影得以紧贴文字，不再贯穿屏幕。
-        // radius 作用于阴影形状（label 背景透明、圆角本身不可见），
-        // 让上下光带边缘弧化更柔和。
+        // v10.5.2 文字光晕层：12 个同文本微偏移副本（主色低透明）叠出字形
+        // 周围 1-3px 渐变光——这是文字光晕的正确形态（盒阴影两版真机翻车：
+        // 全宽盒=上下贯穿光带 v10.5、窄盒=椭圆光圈 v10.5.1，均已废弃）。
+        // 创建在主字之前（层序在残影之上、主字之下）；墨水屏由 apply_theme
+        // 隐藏全部层。x 先按偏移初设，recenter 后跟随主字。
+        for (int i = 0; i < MIN_GLOW_N; i++) {
+            s_min_glow[i] = make_label(mp, s_min_glow_geo[i][0],
+                                       100 + s_min_glow_geo[i][1],
+                                       &lv_font_montserrat_48, t->primary);
+            lv_obj_set_style_text_opa(s_min_glow[i],
+                                      (lv_opa_t)s_min_glow_geo[i][2], 0);
+            lv_label_set_text(s_min_glow[i], "00:00");
+        }
+        // 主字：内容自适应宽度，刷新后手动居中（min_time_recenter）。
+        // v10.5.2 起光晕由多层叠加负责，主字自身不再带任何阴影/圆角。
         s_min_time = make_label(mp, 0, 100, &lv_font_montserrat_48, t->primary);
         lv_label_set_text(s_min_time, "00:00");
-        lv_obj_set_style_radius(s_min_time, 24, 0);
         min_time_recenter();
         // 残影无阴影，仍用"宽度 240 + 居中对齐"，坐标偏移即整体平移
         lv_obj_set_width(s_min_time_ghost1, 240);
@@ -1167,16 +1194,11 @@ static void apply_theme(void)
     lv_obj_set_style_bg_color(s_min_fill, lv_color_hex(t->primary), 0);
     lv_obj_set_style_bg_opa(s_min_fill, eink ? LV_OPA_80 : LV_OPA_70, 0);
     lv_obj_set_style_bg_color(s_min_dot, lv_color_hex(t->warn), 0);
-    // 主字柔光晕（"发光保留"的固件形态）：对象盒阴影呼吸；墨水屏关闭。
-    // v10.5.1 修复：主字已改为内容自适应宽度（不再 width=240），阴影包围
-    // 盒紧贴文字——旧全宽盒的阴影是真机上时间上下各一条 240px 横向贯穿
-    // 光带的直接原因。阴影形状圆角在创建时设置（radius 24）。
-    if (eink) {
-        lv_obj_set_style_shadow_width(s_min_time, 0, 0);
-    } else {
-        lv_obj_set_style_shadow_width(s_min_time, 14, 0);
-        lv_obj_set_style_shadow_spread(s_min_time, 2, 0);
-        lv_obj_set_style_shadow_color(s_min_time, lv_color_hex(t->primary), 0);
+    // 主字文字光晕（v10.5.2：多层微偏移同文本叠加负责，主字自身无阴影；
+    // 盒阴影两版废弃——全宽盒=上下贯穿光带、窄盒=椭圆光圈）。墨水屏全隐藏。
+    for (int i = 0; i < MIN_GLOW_N; i++) {
+        set_text_color(s_min_glow[i], t->primary);
+        (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_min_glow[i], LV_OBJ_FLAG_HIDDEN);
     }
 
     // ---- 同步页 ----
@@ -1237,10 +1259,17 @@ static void update_time_display(void)
     // 未同步呼吸闪烁：与完整模式同一策略（奇数秒半透明，此刻时间不可信）
     lv_obj_set_style_text_opa(s_min_time,
         (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
-    // 主字柔光晕呼吸（发光保留的定稿决定；墨水屏无光晕不呼吸）
-    if (!theme_is_eink()) {
-        lv_obj_set_style_shadow_opa(s_min_time,
-            (tm.tm_sec % 2) ? LV_OPA_30 : LV_OPA_50, 0);
+    // v10.5.2 光晕层文本同步 + 呼吸：随秒二态（0.65/1.0 系数）；未同步
+    // 闪烁的半透明秒同步压暗光晕（与主字同一策略）。墨水屏层已隐藏，
+    // 设置 opa 不产生渲染。
+    {
+        lv_opa_t gk = (lv_opa_t)((tm.tm_sec % 2) ? 166 : 255);
+        if (!st.synced && (tm.tm_sec % 2)) gk = (lv_opa_t)(gk * 60 / 100);
+        for (int i = 0; i < MIN_GLOW_N; i++) {
+            lv_label_set_text(s_min_glow[i], buf);
+            lv_obj_set_style_text_opa(s_min_glow[i],
+                (lv_opa_t)(s_min_glow_geo[i][2] * gk / 255), 0);
+        }
     }
     // 秒进度：主线按本分钟已过秒数填充（112px 满宽）
     {
@@ -1569,6 +1598,7 @@ void demo_cyber_clock_exit(void)
     s_min_time = NULL;
     s_min_time_ghost1 = NULL;
     s_min_time_ghost2 = NULL;
+    for (int i = 0; i < MIN_GLOW_N; i++) s_min_glow[i] = NULL;
     s_min_track = NULL;
     s_min_fill = NULL;
     s_min_date = NULL;
