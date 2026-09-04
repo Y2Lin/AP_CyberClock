@@ -215,8 +215,6 @@ static lv_obj_t *s_stream2;                // 底部十六进制流 >> 0x??????
 static lv_obj_t *s_full_box;             // 完整模式控件层
 static lv_obj_t *s_min_box;              // 精简模式控件层
 static lv_obj_t *s_min_time;             // HH:MM 主字（64px 数字子集，水平居中）
-static lv_obj_t *s_min_time_ghost1;      // 双色差残影 1（整体左偏 4px）
-static lv_obj_t *s_min_time_ghost2;      // 双色差残影 2（右偏 6px 下移 3px）
 static lv_obj_t *s_min_track;            // 秒进度残影轨道（150px 居中，低透明次色）
 static lv_obj_t *s_min_fill;             // 秒进度主线（150px 满宽，按本分钟已过秒数填充）
 static lv_obj_t *s_min_date;             // 日期行 YYYY-MM-DD  WEEKDAY（全行统一暗色）
@@ -775,23 +773,10 @@ static void build_clock_page(void)
     {
         lv_obj_t *mp = s_min_box;
 
-        // 时间组：主字 64px 居中（y=96），双色差残影保留（偏移同完整模式：
-        // 残影 1 整体左偏 4px、残影 2 右偏 6px 下移 3px；墨水屏由 apply_theme 隐藏）
-        s_min_time_ghost1 = make_label(mp, -4, 96, MIN_TIME_FONT, t->secondary);
-        lv_obj_set_style_text_opa(s_min_time_ghost1, LV_OPA_30, 0);
-        lv_label_set_text(s_min_time_ghost1, "00:00");
-        s_min_time_ghost2 = make_label(mp, 6, 99, MIN_TIME_FONT, t->secondary);
-        lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
-        lv_label_set_text(s_min_time_ghost2, "00:00");
         // 主字：内容自适应宽度，刷新后手动居中（min_time_recenter）。
         s_min_time = make_label(mp, 0, 96, MIN_TIME_FONT, t->primary);
         lv_label_set_text(s_min_time, "00:00");
         min_time_recenter();
-        // 残影无阴影，仍用"宽度 240 + 居中对齐"，坐标偏移即整体平移
-        lv_obj_set_width(s_min_time_ghost1, 240);
-        lv_obj_set_style_text_align(s_min_time_ghost1, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_width(s_min_time_ghost2, 240);
-        lv_obj_set_style_text_align(s_min_time_ghost2, LV_TEXT_ALIGN_CENTER, 0);
 
         // 秒进度下划线（v4.5 定稿）：150px 居中（大字宽度的 4/5），3px 加粗，
         // 与主字底保持约 14px 呼吸间距（主线 y=163）；无末端光标。残影轨道
@@ -1153,15 +1138,9 @@ static void apply_theme(void)
     lv_obj_set_style_bg_color(s_batt_cap, lv_color_hex(t->primary), 0);
     set_text_color(s_stream2, t->text_dim);
 
-    // ---- v10.5 精简模式组（残影墨水屏隐藏；主字柔光晕仅非墨水屏）----
+    // ---- v10.5 精简模式组 ----
     set_text_color(s_min_time, t->primary);
-    set_text_color(s_min_time_ghost1, t->secondary);
-    set_text_color(s_min_time_ghost2, t->secondary);
     set_text_color(s_min_date, t->text_dim);
-    lv_obj_set_style_text_opa(s_min_time_ghost1, LV_OPA_30, 0);
-    lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
-    (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_min_time_ghost1, LV_OBJ_FLAG_HIDDEN);
-    (eink ? lv_obj_add_flag : lv_obj_clear_flag)(s_min_time_ghost2, LV_OBJ_FLAG_HIDDEN);
     // 秒进度下划线：残影轨道低透明次色（墨水屏稍高保可见）、主线与光标主色
     lv_obj_set_style_bg_color(s_min_track, lv_color_hex(t->secondary), 0);
     lv_obj_set_style_bg_opa(s_min_track, eink ? LV_OPA_30 : LV_OPA_20, 0);
@@ -1222,8 +1201,6 @@ static void update_time_display(void)
     // v10.5.1：主字内容自适应宽度，文本变化后重新按实际宽度居中
     //（数字字形宽度有差异，如"1"窄于"2"）
     min_time_recenter();
-    lv_label_set_text(s_min_time_ghost1, buf);
-    lv_label_set_text(s_min_time_ghost2, buf);
     // 未同步呼吸闪烁：与完整模式同一策略（奇数秒半透明，此刻时间不可信）
     lv_obj_set_style_text_opa(s_min_time,
         (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
@@ -1552,8 +1529,6 @@ void demo_cyber_clock_exit(void)
     s_full_box = NULL;
     s_min_box = NULL;
     s_min_time = NULL;
-    s_min_time_ghost1 = NULL;
-    s_min_time_ghost2 = NULL;
     s_min_track = NULL;
     s_min_fill = NULL;
     s_min_date = NULL;
