@@ -15,6 +15,7 @@ idf_component_register(
          "usb_time_sync.c"
          "cyber_clock.c"
          "battery_gauge.c"
+         "lv_font_montserrat_64_digits.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash esp_driver_usb_serial_jtag
 )

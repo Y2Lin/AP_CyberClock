@@ -53,10 +53,16 @@ static const char *TAG = "cyber_clk";
 // LVGL 透明度预置档只有 10 的整数倍：残影 2 的 0.15 档自定义（38/255）
 #define GHOST2_OPA ((lv_opa_t)38)
 
-// v10.5.2 文字光晕层数：LVGL label 无按字形阴影（盒阴影两次翻车：全宽盒
-// =贯穿光带、窄盒=椭圆光圈），改用多层微偏移同文本叠加模拟字形周围的
-// 渐变光（CSS text-shadow blur 的近似形态）
-#define MIN_GLOW_N 12
+// v10.6 文字光晕层数：16 层（2-5px 偏移），对应设计图 v4.5 的双层大光晕
+// （14px 贴字 + 34px 铺开）。层数多 → 光晕过渡更平滑、铺得更开。
+#define MIN_GLOW_N 16
+
+// 64px 数字字体子集（仅 0-9 + : + 空格，由 lv_font_conv 生成；montserrat
+// 内置最大 48px，精简模式 64px 大字用这个子集）
+LV_FONT_DECLARE(lv_font_montserrat_64_digits);
+
+// 精简模式主字字体指针（方便统一替换；当前 = 64px 数字子集）
+#define MIN_TIME_FONT (&lv_font_montserrat_64_digits)
 
 // ============================================================================
 // 配色主题
@@ -212,22 +218,39 @@ static lv_obj_t *s_stream2;                // 底部十六进制流 >> 0x??????
 // 互不干扰（比逐控件增删 HIDDEN 标志干净，也不必重排完整模式布局）。
 static lv_obj_t *s_full_box;             // 完整模式控件层
 static lv_obj_t *s_min_box;              // 精简模式控件层
-static lv_obj_t *s_min_time;             // HH:MM 主字（48px，水平居中）
+static lv_obj_t *s_min_time;             // HH:MM 主字（64px 数字子集，水平居中）
 static lv_obj_t *s_min_time_ghost1;      // 双色差残影 1（整体左偏 4px）
 static lv_obj_t *s_min_time_ghost2;      // 双色差残影 2（右偏 6px 下移 3px）
-static lv_obj_t *s_min_track;            // 秒进度残影轨道（112px 居中，低透明次色）
-static lv_obj_t *s_min_fill;             // 秒进度主线（112px 满宽，按本分钟已过秒数填充）
+static lv_obj_t *s_min_track;            // 秒进度残影轨道（150px 居中，低透明次色）
+static lv_obj_t *s_min_fill;             // 秒进度主线（150px 满宽，按本分钟已过秒数填充）
 static lv_obj_t *s_min_date;             // 日期行 YYYY-MM-DD  WEEKDAY（全行统一暗色）
 static lv_obj_t *s_min_dot;              // 低电量红点（8x8 圆，仅 SOC<20% 出现）
 static lv_obj_t *s_min_glow[MIN_GLOW_N]; // 主字文字光晕层（微偏移同文本低透明叠加）
 
-// 光晕层几何：{dx, dy, opa/255}。对角内环最亮紧贴字形、十字内环次之、
-// 十字外环最淡负责铺开范围；主字盖在最上层，露出的只有字形边缘 1-3px
-// 的渐变光带。opa 数值真机可再调。
+// 光晕层几何：{dx, dy, opa/255}。16 层分四档：
+//   对角 2px（最亮，贴字形内圈）
+//   十字 2px（次亮）
+//   十字 3px（中等，外圈）
+//   十字 5px（最淡，大范围铺开）
+// 模拟 CSS text-shadow 双层 blur 效果（贴字 + 铺开）。
 static const int8_t s_min_glow_geo[MIN_GLOW_N][3] = {
-    { -1, -1, 90 }, { 1, -1, 90 }, { -1, 1, 90 }, {  1,  1, 90 }, // 对角内环
-    {  0, -2, 70 }, { 0,  2, 70 }, { -2,  0, 70 }, {  2,  0, 70 }, // 十字内环
-    {  0, -3, 45 }, { 0,  3, 45 }, { -3,  0, 45 }, {  3,  0, 45 }, // 十字外环
+    { -2, -2, 100 }, {  2, -2, 100 }, { -2, 2, 100 }, {  2,  2, 100 }, // 对角内圈
+    {  0, -2,  80 }, {  0,  2,  80 }, { -2, 0,  80 }, {  2,  0,  80 }, // 十字内圈
+    {  0, -3,  55 }, {  0,  3,  55 }, { -3, 0,  55 }, {  3,  0,  55 }, // 十字中圈
+    {  0, -5,  30 }, {  0,  5,  30 }, { -5, 0,  30 }, {  5,  0,  30 }, // 十字外圈（铺开）
+};
+
+// 光晕呼吸状态：3s 周期，100ms tick 推进，余弦缓动（查表）。
+// s_glow_breathe_ticks 范围 0..29（共 30 步 = 3s/100ms）
+// s_glow_breathe_val   166..255（当前呼吸强度系数，预计算供 update 使用）
+static int s_glow_breathe_ticks = 0;
+static lv_opa_t s_glow_breathe_val = 255;
+
+/* 光晕呼吸 30 步余弦查找表（3s 周期 @ 100ms tick）。值范围 166..255，对应 0.65..1.0 强度 */
+static const uint8_t s_glow_breathe_table[30] = {
+    255,254,251,247,240,233,224,215,206,197,
+    188,181,174,170,167,166,167,170,174,181,
+    188,197,206,215,224,233,240,247,251,254,
 };
 
 // ---- 表盘动效状态（100ms tick 驱动）----
@@ -778,39 +801,39 @@ static void build_clock_page(void)
     lv_label_set_text(s_stream2, ">> 0x000000");
 
     // ====================================================================
-    // v10.5 精简模式层（定稿方案 C）：只显示 HH:MM 大字 + 紧贴其下的秒
-    // 进度线 + 日期行，外加低于 20% 才出现的低电量红点；其余一切元素
-    // （外框/刻度/顶栏/频谱/终端行/心形/电池条/底流）都在完整层，不出现在本层。
-    // 布局对应设计图 v4（内容整体上移、星期并入日期行且全行统一暗色）。
+    // v10.6 精简模式层（设计图 v4.5 定稿）：HH:MM 64px 大字 + 紧贴其下的
+    // 秒进度线 + 日期行 + 低电红点；64px 数字子集（lv_font_conv 生成，仅
+    // 0-9 + : + 空格），下划线 150px×3px 加粗（字宽 4/5），16 层光晕 2-5px
+    // 偏移模拟双层大光晕，3s 余弦缓动呼吸。布局对应设计图 v4.5 修订 4。
     // ====================================================================
     s_min_box = make_layer(page);
     {
         lv_obj_t *mp = s_min_box;
 
-        // 时间组：主字 48px 居中（y=100），双色差残影保留（偏移同完整模式：
+        // 时间组：主字 64px 居中（y=96），双色差残影保留（偏移同完整模式：
         // 残影 1 整体左偏 4px、残影 2 右偏 6px 下移 3px；墨水屏由 apply_theme 隐藏）
-        s_min_time_ghost1 = make_label(mp, -4, 100, &lv_font_montserrat_48, t->secondary);
+        s_min_time_ghost1 = make_label(mp, -4, 96, MIN_TIME_FONT, t->secondary);
         lv_obj_set_style_text_opa(s_min_time_ghost1, LV_OPA_30, 0);
         lv_label_set_text(s_min_time_ghost1, "00:00");
-        s_min_time_ghost2 = make_label(mp, 6, 103, &lv_font_montserrat_48, t->secondary);
+        s_min_time_ghost2 = make_label(mp, 6, 99, MIN_TIME_FONT, t->secondary);
         lv_obj_set_style_text_opa(s_min_time_ghost2, GHOST2_OPA, 0);
         lv_label_set_text(s_min_time_ghost2, "00:00");
-        // v10.5.2 文字光晕层：12 个同文本微偏移副本（主色低透明）叠出字形
-        // 周围 1-3px 渐变光——这是文字光晕的正确形态（盒阴影两版真机翻车：
-        // 全宽盒=上下贯穿光带 v10.5、窄盒=椭圆光圈 v10.5.1，均已废弃）。
+        // v10.6 文字光晕层：16 个同文本微偏移副本（主色低透明）叠出字形
+        // 周围 2-5px 渐变光（模拟 CSS text-shadow 双层 blur：贴字 + 铺开）。
+        // 3s 余弦缓动呼吸只作用于光晕层（不连主字一起闪）。
         // 创建在主字之前（层序在残影之上、主字之下）；墨水屏由 apply_theme
         // 隐藏全部层。x 先按偏移初设，recenter 后跟随主字。
         for (int i = 0; i < MIN_GLOW_N; i++) {
             s_min_glow[i] = make_label(mp, s_min_glow_geo[i][0],
-                                       100 + s_min_glow_geo[i][1],
-                                       &lv_font_montserrat_48, t->primary);
+                                       96 + s_min_glow_geo[i][1],
+                                       MIN_TIME_FONT, t->primary);
             lv_obj_set_style_text_opa(s_min_glow[i],
                                       (lv_opa_t)s_min_glow_geo[i][2], 0);
             lv_label_set_text(s_min_glow[i], "00:00");
         }
         // 主字：内容自适应宽度，刷新后手动居中（min_time_recenter）。
-        // v10.5.2 起光晕由多层叠加负责，主字自身不再带任何阴影/圆角。
-        s_min_time = make_label(mp, 0, 100, &lv_font_montserrat_48, t->primary);
+        // v10.6 起光晕由 16 层叠加负责，主字自身无阴影。
+        s_min_time = make_label(mp, 0, 96, MIN_TIME_FONT, t->primary);
         lv_label_set_text(s_min_time, "00:00");
         min_time_recenter();
         // 残影无阴影，仍用"宽度 240 + 居中对齐"，坐标偏移即整体平移
@@ -819,20 +842,20 @@ static void build_clock_page(void)
         lv_obj_set_width(s_min_time_ghost2, 240);
         lv_obj_set_style_text_align(s_min_time_ghost2, LV_TEXT_ALIGN_CENTER, 0);
 
-        // 秒进度下划线（v4.4 定稿）：112px 居中（大字宽度的 4/5），与主字
-        // 底保持 8px 呼吸间距（主线 y=149）；无末端光标。残影轨道 112x2
-        // 低透明次色，比主线右错 2px 低 1px（双色差残影语言）；主线 112x2（70% 亮度）
-        // 主色按本分钟已过秒数填充。真机可按字形度量微调。
-        s_min_track = make_rect(mp, 66, 150, 112, 2, t->secondary);
+        // 秒进度下划线（v4.5 定稿）：150px 居中（大字宽度的 4/5），3px 加粗，
+        // 与主字底保持约 14px 呼吸间距（主线 y=163）；无末端光标。残影轨道
+        // 150x3 低透明次色，比主线右错 2px 低 1px（双色差残影语言）；主线
+        // 150x3（70% 亮度）主色按本分钟已过秒数填充。真机可按字形度量微调。
+        s_min_track = make_rect(mp, 45, 164, 150, 3, t->secondary);
         lv_obj_set_style_bg_opa(s_min_track, LV_OPA_20, 0);
-        s_min_fill = make_rect(mp, 64, 149, 1, 2, t->primary);
+        s_min_fill = make_rect(mp, 43, 163, 1, 3, t->primary);
         // 主线 70% 亮度（创作者定稿：全亮主色在深色主题下过亮；墨水屏
         // 对比度低，apply_theme 提到 80% 保可见）
         lv_obj_set_style_bg_opa(s_min_fill, LV_OPA_70, 0);
 
-        // 日期行 y196：YYYY-MM-DD  WEEKDAY，16px 全行统一暗色（定稿：星期
+        // 日期行 y210：YYYY-MM-DD  WEEKDAY，16px 全行统一暗色（定稿：星期
         // 不再主色点亮）。分隔用双空格——montserrat 无中点(U+00B7)字形
-        s_min_date = make_label(mp, 0, 196, &lv_font_montserrat_16, t->text_dim);
+        s_min_date = make_label(mp, 0, 210, &lv_font_montserrat_16, t->text_dim);
         lv_obj_set_width(s_min_date, 240);
         lv_obj_set_style_text_align(s_min_date, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_text(s_min_date, "2026-01-01  THU");
@@ -1259,11 +1282,13 @@ static void update_time_display(void)
     // 未同步呼吸闪烁：与完整模式同一策略（奇数秒半透明，此刻时间不可信）
     lv_obj_set_style_text_opa(s_min_time,
         (!st.synced && (tm.tm_sec % 2)) ? LV_OPA_60 : LV_OPA_COVER, 0);
-    // v10.5.2 光晕层文本同步 + 呼吸：随秒二态（0.65/1.0 系数）；未同步
-    // 闪烁的半透明秒同步压暗光晕（与主字同一策略）。墨水屏层已隐藏，
+    // v10.6 光晕层文本同步 + 呼吸：呼吸强度由 100ms tick 用余弦缓动预计算
+    // （s_glow_breathe_val），这里直接乘系数——呼吸只作用于光晕层，不再
+    // 连主字一起硬切闪烁。未同步时主字的半透明闪烁仍然保留（时间不可信
+    // 的提示语义），此时光晕同步压暗（与主字同一策略）。墨水屏层已隐藏，
     // 设置 opa 不产生渲染。
     {
-        lv_opa_t gk = (lv_opa_t)((tm.tm_sec % 2) ? 166 : 255);
+        lv_opa_t gk = s_glow_breathe_val;
         if (!st.synced && (tm.tm_sec % 2)) gk = (lv_opa_t)(gk * 60 / 100);
         for (int i = 0; i < MIN_GLOW_N; i++) {
             lv_label_set_text(s_min_glow[i], buf);
@@ -1271,11 +1296,11 @@ static void update_time_display(void)
                 (lv_opa_t)(s_min_glow_geo[i][2] * gk / 255), 0);
         }
     }
-    // 秒进度：主线按本分钟已过秒数填充（112px 满宽）
+    // 秒进度：主线按本分钟已过秒数填充（150px 满宽）
     {
-        int fw = ((tm.tm_sec + 1) * 112) / 60;
+        int fw = ((tm.tm_sec + 1) * 150) / 60;
         if (fw < 1) fw = 1;
-        if (fw > 112) fw = 112;
+        if (fw > 150) fw = 150;
         lv_obj_set_width(s_min_fill, fw);
     }
     // 日期行：YYYY-MM-DD  WEEKDAY（定稿：星期并入日期行，全行统一暗色；
@@ -1424,6 +1449,18 @@ static void clock_fx_tick(void)
     // 故障爆发：3 个 tick（300ms）后恢复常态
     if (s_glitch_ticks > 0 && --s_glitch_ticks == 0) {
         glitch_restore();
+    }
+    // v10.6 精简模式光晕呼吸：3s 周期余弦缓动，100ms 推进一步。
+    // 完整模式 / 墨水屏时只推进计数器（保持节奏连续），不刷 opa（控件隐藏）。
+    s_glow_breathe_ticks = (s_glow_breathe_ticks + 1) % 30;
+    s_glow_breathe_val = (lv_opa_t)s_glow_breathe_table[s_glow_breathe_ticks];
+    if (!mode_is_full() && !theme_is_eink()) {
+        for (int i = 0; i < MIN_GLOW_N; i++) {
+            if (s_min_glow[i]) {
+                lv_obj_set_style_text_opa(s_min_glow[i],
+                    (lv_opa_t)(s_min_glow_geo[i][2] * s_glow_breathe_val / 255), 0);
+            }
+        }
     }
 }
 
